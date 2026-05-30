@@ -738,12 +738,12 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
                             player_controller->SetControlRotation(target_rotation);
 
-                            // Let the turret resolve pitch/yaw against current hull tilt rather than
-                            // jamming a world rotation into the hull-relative TargetTurretRotation slot.
-                            if (self->TurretComponent) {
-                                self->TurretComponent->bOverrideAim = false;
-                                self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
-                            }
+// Let the turret resolve pitch/yaw against current hull tilt rather than
+// jamming a world rotation into the hull-relative TargetTurretRotation slot.
+if (self->TurretComponent) {
+    self->TurretComponent->bOverrideAim = false;
+    self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
+}
                             }
                         }
                     }
