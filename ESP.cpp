@@ -37,6 +37,55 @@ namespace
 
     static std::map<SDK::ATyrPlayerStateBase*, LastSeenEntityInfo> g_LastSeenEntityCache;
 
+    template <typename T>
+    static bool IsUsableObject(T* Object)
+    {
+        return Object && ISVALID(Object);
+    }
+
+    static bool IsUsableTank(SDK::ABP_BaseTank_C* Tank)
+    {
+        return Tank && ISVALID(Tank) && !Tank->IsActorBeingDestroyed();
+    }
+
+    static SDK::FLinearColor GetFriendlyOverlayColor()
+    {
+        return SDK::FLinearColor{ 0.f, 1.f, 0.f, 1.f };
+    }
+
+    static SDK::FLinearColor GetEnemyOverlayColor()
+    {
+        return SDK::FLinearColor{ 1.f, 0.f, 0.f, 1.f };
+    }
+
+    static SDK::FLinearColor GetNeutralOverlayColor()
+    {
+        return SDK::FLinearColor{ 1.f, 1.f, 1.f, 1.f };
+    }
+
+    static bool TryIsEnemy(SDK::ATyrPlayerStateBase* SelfState, SDK::ATyrPlayerStateBase* OtherState, bool* OutIsEnemy)
+    {
+        if (!OutIsEnemy)
+        {
+            return false;
+        }
+
+        *OutIsEnemy = false;
+        if (!IsUsableObject(SelfState) || !IsUsableObject(OtherState))
+        {
+            return false;
+        }
+
+        *OutIsEnemy = OtherState->GetTeamId() != SelfState->GetTeamId();
+        return true;
+    }
+
+    static SDK::FLinearColor GetRelationshipOverlayColor(SDK::ATyrPlayerStateBase* SelfState, SDK::ATyrPlayerStateBase* OtherState)
+    {
+        bool bIsEnemy = false;
+        return TryIsEnemy(SelfState, OtherState, &bIsEnemy) ? (bIsEnemy ? GetEnemyOverlayColor() : GetFriendlyOverlayColor()) : GetNeutralOverlayColor();
+    }
+
     static bool IsTrackedPlayerAlive(SDK::ATyrPlayerStateBase* PlayerState)
     {
         if (!PlayerState || !ISVALID(PlayerState))
@@ -118,20 +167,24 @@ namespace
             DrawFilledCircle(rootScreen, 4.0f, drawColor, nullptr, Canvas);
 
             const std::wstring displayText = BuildEntityLabel(CachedInfo.VehicleName, SelfLocation, CachedInfo.LastRootWorld) + L" [last]";
-            Canvas->K2_DrawText(
-                get_roboto(),
-                FString(displayText.c_str()),
-                SDK::FVector2D(rootScreen.X, rootScreen.Y + 15.0f),
-                SDK::FVector2D(1.0f, 1.0f),
-                drawColor,
-                1.0f,
-                SDK::FLinearColor{ 0, 0, 0, 1 },
-                SDK::FVector2D(0, 0),
-                true,
-                true,
-                true,
-                SDK::FLinearColor{ 0, 0, 0, 0.7f }
-            );
+            UFont* const Roboto = get_roboto();
+            if (Roboto && ISVALID(Roboto))
+            {
+                Canvas->K2_DrawText(
+                    Roboto,
+                    FString(displayText.c_str()),
+                    SDK::FVector2D(rootScreen.X, rootScreen.Y + 15.0f),
+                    SDK::FVector2D(1.0f, 1.0f),
+                    drawColor,
+                    1.0f,
+                    SDK::FLinearColor{ 0, 0, 0, 1 },
+                    SDK::FVector2D(0, 0),
+                    true,
+                    true,
+                    true,
+                    SDK::FLinearColor{ 0, 0, 0, 0.7f }
+                );
+            }
         }
     }
 }
@@ -184,14 +237,17 @@ UWorld* GetWorld()
 
 APlayerController* GetPlayerController()
 {
-    if (auto const World = UWorld::GetWorld();
-        World &&
-        World->OwningGameInstance &&
-        World->OwningGameInstance->LocalPlayers[0] &&
-        World->OwningGameInstance->LocalPlayers[0]->PlayerController)
-    {
-        return World->OwningGameInstance->LocalPlayers[0]->PlayerController;
-    }
+    auto const World = UWorld::GetWorld();
+    if (!World || !World->OwningGameInstance || World->OwningGameInstance->LocalPlayers.Num() <= 0)
+        return nullptr;
+
+    auto* localPlayer = World->OwningGameInstance->LocalPlayers[0];
+    if (!localPlayer)
+        return nullptr;
+
+    if (localPlayer->PlayerController)
+        return localPlayer->PlayerController;
+
     return nullptr;
 }
 
@@ -200,6 +256,8 @@ ABP_BaseTank_C* GetSelf()
     if (auto const PC = GetPlayerController();
         PC &&
         PC->Pawn &&
+        ISVALID(PC->Pawn) &&
+        !PC->Pawn->IsActorBeingDestroyed() &&
         PC->Pawn->IsA(ABP_BaseTank_C::StaticClass()))
     {
         return (ABP_BaseTank_C*)PC->Pawn;
@@ -208,6 +266,12 @@ ABP_BaseTank_C* GetSelf()
 }
 
 UFont* get_roboto() {
+    if (font && ISVALID(font))
+        return font;
+
+    if (!UObject::GObjects)
+        return nullptr;
+
     if (!font) {
         for (int i = 0; i < UObject::GObjects->Num(); ++i)
         {
@@ -225,6 +289,30 @@ UFont* get_roboto() {
     return font;
 }
 
+static void DrawTextSafe(
+    UCanvas* Canvas,
+    const FString& Text,
+    const FVector2D& ScreenPosition,
+    const FVector2D& Scale,
+    const FLinearColor& Color,
+    float Kerning,
+    const FLinearColor& ShadowColor,
+    const FVector2D& ShadowOffset,
+    bool bCentreX,
+    bool bCentreY,
+    bool bOutlined,
+    const FLinearColor& OutlineColor)
+{
+    if (!Canvas)
+        return;
+
+    UFont* const Roboto = get_roboto();
+    if (!Roboto || !ISVALID(Roboto))
+        return;
+
+    Canvas->K2_DrawText(Roboto, Text, ScreenPosition, Scale, Color, Kerning, ShadowColor, ShadowOffset, bCentreX, bCentreY, bOutlined, OutlineColor);
+}
+
 bool IsValidScreenLoc(const FVector2D& Loc)
 {
     return Loc.X >= 0 && Loc.Y >= 0;
@@ -236,6 +324,7 @@ bool IsValidScreenLoc(const FVector& Loc)
 
 void DrawFilledCircle(FVector2D pos, float r, FLinearColor color, UGameViewportClient* ViewportClient, UCanvas* Canvas)
 {
+    if (!Canvas) return;
     float smooth = 0.07f;
     int size = (int)(2.0f * PI / smooth) + 1;
     float angle = 0.0f;
@@ -247,6 +336,7 @@ void DrawFilledCircle(FVector2D pos, float r, FLinearColor color, UGameViewportC
 
 void DrawCircle(FVector2D pos, int radius, int numSides, FLinearColor Color, UGameViewportClient* ViewportClient, UCanvas* Canvas)
 {
+    if (!Canvas || numSides <= 0) return;
     float Step = PI * 2.0 / numSides;
     int Count = 0;
     FVector2D V[128];
@@ -265,11 +355,13 @@ void DrawCircle(FVector2D pos, int radius, int numSides, FLinearColor Color, UGa
 
 void DrawLine(UCanvas* Canvas, int x, int y, int xx, int yy, const FLinearColor& RenderColor, int thicknes)
 {
+    if (!Canvas) return;
     Canvas->K2_DrawLine(FVector2D(x, y), FVector2D(xx, yy), thicknes, RenderColor);
 }
 
 void CornerBox(UCanvas* Canvas, int x, int y, int w, int h, int thickness, const FLinearColor& color)
 {
+    if (!Canvas) return;
     int bWidth = w;
     int bHeight = h;
     float constant = 3.5;
@@ -286,7 +378,7 @@ void CornerBox(UCanvas* Canvas, int x, int y, int w, int h, int thickness, const
 
 void DrawPlayerBounds(UCanvas* Canvas, APlayerController* PlayerController, SDK::ABP_BaseTank_C* Tank, const FLinearColor& color, int thickness) {
 
-    if (!Canvas || !PlayerController || !Tank) return;
+    if (!Canvas || !PlayerController || !IsUsableTank(Tank)) return;
 
 
 
@@ -294,7 +386,7 @@ void DrawPlayerBounds(UCanvas* Canvas, APlayerController* PlayerController, SDK:
 
 
 
-    if (!ArmorMesh) return;
+    if (!ArmorMesh || !ISVALID(ArmorMesh)) return;
 
 
 
@@ -482,11 +574,11 @@ void ApplyTurretMods(SDK::UBPC_TurretBaseComponent_C* Turret)
 void ApplyWeaponMods()
 {
     auto self = GetSelf();
-    if (!self) return;
+    if (!IsUsableTank(self)) return;
 
     // 1. Access the Shell Firing Component
     SDK::UBPC_ShellFiringComponent_C* ShellComp = self->ShellFiringComponent;
-    if (!ShellComp) return;
+    if (!ShellComp || !ISVALID(ShellComp)) return;
 
     // --- NO RECOIL ---
     // Zeroing these prevents the "kick" and "camera shake" when firing
@@ -518,14 +610,17 @@ void ApplyWeaponMods()
 }
 
 void Loop(UCanvas* Canvas) {
-    if (!GetPlayerController()) return;
+    if (!Canvas) return;
 
-    FLinearColor Orange{ 1.0f, 0.5f, 0.0f, 1.0f };
+    APlayerController* const playerController = GetPlayerController();
+    if (!playerController) return;
+
+    const FLinearColor StatusColor = GetNeutralOverlayColor();
     std::wstring output = L"Enabled";
-    Canvas->K2_DrawText(get_roboto(), FString::FString(output.c_str()), FVector2D(60.f, 60.f), FVector2D(1, 1), Orange, 0, FLinearColor{ 0, 0, 0, 1 }, FVector2D(3, 3), 1, 0, 1, FLinearColor{ 0, 0, 0, 1 });
+    DrawTextSafe(Canvas, FString::FString(output.c_str()), FVector2D(60.f, 60.f), FVector2D(1, 1), StatusColor, 0, FLinearColor{ 0, 0, 0, 1 }, FVector2D(3, 3), 1, 0, 1, FLinearColor{ 0, 0, 0, 1 });
 
     ABP_BaseTank_C* self = GetSelf();
-    if (!self) return;
+    if (!IsUsableTank(self)) return;
 
 
       auto tyr = GetTyrGameActionMessageStatics();
@@ -564,18 +659,18 @@ void Loop(UCanvas* Canvas) {
       if (GetAsyncKeyState(VK_NEXT) & 0x8000) // VK_NEXT is Page Down
       {
           // Get current rotation
-          SDK::FRotator CurrentRot = GetSelf()->K2_GetActorRotation();
+          SDK::FRotator CurrentRot = self->K2_GetActorRotation();
 
           // Add 2.0 degrees to the Yaw (horizontal rotation)
           CurrentRot.Yaw += 5.0f;
 
           // Apply the new rotation
-          GetSelf()->K2_SetActorRotation(CurrentRot, true); // true = teleport/smooth update
+          self->K2_SetActorRotation(CurrentRot, true); // true = teleport/smooth update
       }
 
 
 
-    ApplyTurretMods(GetSelf()->TurretComponent);
+    ApplyTurretMods((self->TurretComponent && ISVALID(self->TurretComponent)) ? self->TurretComponent : nullptr);
 
 
     ApplyWeaponMods();
@@ -738,7 +833,7 @@ void Loop(UCanvas* Canvas) {
 
     if (GetAsyncKeyState(VK_NUMPAD9) & 0x8000)
     {
-        APlayerController* PC = GetPlayerController();
+        APlayerController* PC = playerController;
         if (!PC) return;
 
         UWorld* World = GetWorld();
@@ -749,7 +844,7 @@ void Loop(UCanvas* Canvas) {
                 if (Actor && Actor->IsA(ATyrPlayerStateBase::StaticClass()))
                 {
                     auto PlayerState = static_cast<ATyrPlayerStateBase*>(Actor);
-                    if (PlayerState && PlayerState->PawnPrivate)
+                    if (PlayerState && IsUsableObject(PlayerState->PawnPrivate))
                     {
                         FVector worldLocation = PlayerState->PawnPrivate->K2_GetActorLocation();
                         FVector2D screenLocation;
@@ -773,36 +868,7 @@ void Loop(UCanvas* Canvas) {
 
     if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000)
     {
-        auto tyr = GetTyrGameActionMessageStatics();
-        auto self_ps = tyr.GetTyrPlayerStateFromObject(GetSelf());
-        if (self_ps)
-        {
-            UWorld* World = GetWorld();
-            if (World)
-            {
-                ULevel* Level = World->PersistentLevel;
-                if (Level)
-                {
-                    TArray<AActor*>& Actors = Level->Actors;
-                    for (AActor* Actor : Actors)
-                    {
-                        if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
-                            continue;
-
-                        auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
-                        if (Player == self) continue;
-
-                        auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
-                        if (player_ps && player_ps->GetTeamId() != self_ps->GetTeamId())
-                        {
-                            // Found an enemy, switch to their team
-                            self_ps->MyTeamID.TeamId = player_ps->GetTeamId();
-                            break; // Exit after switching
-                        }
-                    }
-                }
-            }
-        }
+        DebugPrintf("VK_NUMPAD4 team mutation path disabled for safety.");
     }
 
     if (GetAsyncKeyState(VK_NUMPAD5) & 0x8000)
@@ -834,11 +900,10 @@ void Loop(UCanvas* Canvas) {
                             auto other_sight_comp = static_cast<UTyrPlayerSightComponent*>(player_sight_component);
                             
                             // 1. Call the Native Spotting Functions
-                            APlayerController* PC = GetPlayerController();
-                            if (PC)
+                            if (playerController)
                             {
-                                other_sight_comp->K2_SpottedPlayer(PC);
-                                other_sight_comp->NotifySpottedPlayer(PC);
+                                other_sight_comp->K2_SpottedPlayer(playerController);
+                                other_sight_comp->NotifySpottedPlayer(playerController);
                             }
 
                             // 2. Apply the Spotted Gameplay Effect (If Valid)
@@ -862,7 +927,7 @@ void Loop(UCanvas* Canvas) {
     if (GetAsyncKeyState(VK_NUMPAD6))
     {
         DebugPrintf("VK_NUMPAD6 pressed.");
-        APlayerController* player_controller = GetPlayerController();
+        APlayerController* player_controller = playerController;
         if (player_controller)
         {
             FVector camera_loc;
@@ -920,7 +985,7 @@ void Loop(UCanvas* Canvas) {
                                     std::wstring armor_name_wstr(armor_name_str.begin(), armor_name_str.end());
                                     std::wstring armor_info_str = L"Armor: " + armor_name_wstr + L" (" + std::to_wstring(armor_thickness) + L"mm)";
                                     auto tyr = GetTyrGameActionMessageStatics();
-                                    auto ps_self = tyr.GetTyrPlayerStateFromObject(GetSelf());
+                                    auto ps_self = tyr.GetTyrPlayerStateFromObject(self);
                                     
                                     float self_pen = 0.0f;
                                     if (ps_self && ps_self->VehicleStatsAttribute)
@@ -940,7 +1005,7 @@ void Loop(UCanvas* Canvas) {
                                     player_controller->GetViewportSize(&sx, &sy);
                                     FVector2D screen_center(sx / 2.0f, sy / 2.0f);
 
-                                    Canvas->K2_DrawText(get_roboto(), FString(armor_info_str.c_str()), screen_center, FVector2D(1.f, 1.f), FLinearColors::White, 1.0f, FLinearColor(0, 0, 0, 1), FVector2D(1, 1), true, true, true, FLinearColor(0, 0, 0, 0.7));
+                                    DrawTextSafe(Canvas, FString(armor_info_str.c_str()), screen_center, FVector2D(1.f, 1.f), GetNeutralOverlayColor(), 1.0f, FLinearColor(0, 0, 0, 1), FVector2D(1, 1), true, true, true, FLinearColor(0, 0, 0, 0.7));
                                     break;
                                 }
                                 else
@@ -961,7 +1026,7 @@ void Loop(UCanvas* Canvas) {
 
     if (hasTargetedBoneThisFrame)
     {
-        Canvas->K2_DrawText(get_roboto(), FString(targetedBoneName.c_str()), targetedBoneScreenLocation, FVector2D(1.f, 1.f), FLinearColors::Yellow, 1.0f, FLinearColor(0, 0, 0, 1), FVector2D(1, 1), true, true, true, FLinearColor(0, 0, 0, 0.7));
+        DrawTextSafe(Canvas, FString(targetedBoneName.c_str()), targetedBoneScreenLocation, FVector2D(1.f, 1.f), FLinearColor{ 1.f, 1.f, 0.f, 1.f }, 1.0f, FLinearColor(0, 0, 0, 1), FVector2D(1, 1), true, true, true, FLinearColor(0, 0, 0, 0.7));
     }
 
     UWorld* World = GetWorld();
@@ -976,11 +1041,17 @@ void Loop(UCanvas* Canvas) {
             TArray<AActor*>& Actors = Level->Actors;
             for (AActor* Actor : Actors)
             {
-                if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
+                if (!Actor || !ISVALID(Actor) || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
                     continue;
 
                 auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
-                if (Player == self || !Player->GetPhysicsMesh()) continue;
+                if (!IsUsableTank(Player) || Player == self) continue;
+
+                auto* const physicsMesh = Player->GetPhysicsMesh();
+                if (!physicsMesh || !ISVALID(physicsMesh)) continue;
+
+                const int32 physicsBoneCount = physicsMesh->GetNumBones();
+                if (physicsBoneCount <= 0) continue;
 
                 auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
                 if (!player_ps)
@@ -988,7 +1059,8 @@ void Loop(UCanvas* Canvas) {
                     continue;
                 }
 
-                const bool bIsEnemy = self_ps && (player_ps->GetTeamId() != self_ps->GetTeamId());
+                bool bIsEnemy = false;
+                const bool bHasTeamRelation = TryIsEnemy(self_ps, player_ps, &bIsEnemy);
 
                 if (Player->IsActorBeingDestroyed() || !IsTrackedPlayerAlive(player_ps))
                 {
@@ -996,22 +1068,23 @@ void Loop(UCanvas* Canvas) {
                     continue;
                 }
 
-
-                FVector rootPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(0));
-                FVector headPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(6)); // Common head bone index
+                const int32 headBoneIndex = physicsBoneCount > 6 ? 6 : 0;
+                FVector rootPos = physicsMesh->GetSocketLocation(physicsMesh->GetBoneName(0));
+                FVector headPos = physicsMesh->GetSocketLocation(physicsMesh->GetBoneName(headBoneIndex));
+                if (rootPos.IsZero() && headPos.IsZero()) continue;
 
                 FVector2D rootScreen, headScreen;
 
-                bool rootOnScreen = GetPlayerController()->ProjectWorldLocationToScreen(rootPos, &rootScreen, true);
-                bool headOnScreen = GetPlayerController()->ProjectWorldLocationToScreen(headPos, &headScreen, true);
+                bool rootOnScreen = playerController->ProjectWorldLocationToScreen(rootPos, &rootScreen, true);
+                bool headOnScreen = playerController->ProjectWorldLocationToScreen(headPos, &headScreen, true);
 
                 if (rootOnScreen) // A single point on screen is enough to try drawing the box
                 {
-                    auto Color = FLinearColors::Red;
+                    const auto Color = GetRelationshipOverlayColor(self_ps, player_ps);
                     bool bPlayerPartiallyVisible = false;
                     bool bCanPenetrate = false;
 
-                    FVector muzzle_loc = self->VisualMesh->GetSocketLocation(GunSocketName);
+                    FVector muzzle_loc = (self->VisualMesh && ISVALID(self->VisualMesh)) ? self->VisualMesh->GetSocketLocation(GunSocketName) : FVector{};
                     if (!muzzle_loc.IsZero())
                     {
                         if (Player->ArmorPartsMeshList.Num() > 0)
@@ -1019,7 +1092,7 @@ void Loop(UCanvas* Canvas) {
                             for (int i = 0; i < Player->ArmorPartsMeshList.Num(); i++)
                             {
                                 UMeshComponent* MeshPart = Player->ArmorPartsMeshList[i];
-                                if (MeshPart && MeshPart->IsA(USkeletalMeshComponent::StaticClass()))
+                                if (MeshPart && ISVALID(MeshPart) && MeshPart->IsA(USkeletalMeshComponent::StaticClass()))
                                 {
                                     auto SkelMeshPart = static_cast<USkeletalMeshComponent*>(MeshPart);
                                     int32 NumBones = SkelMeshPart->GetNumBones();
@@ -1079,9 +1152,9 @@ void Loop(UCanvas* Canvas) {
                                                             {
                                                                 int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
                                                                 auto tyr = GetTyrGameActionMessageStatics();
-                                                                if (!GetSelf())
+                                                                if (!self)
                                                                     continue;
-                                                                auto ps_self = tyr.GetTyrPlayerStateFromObject(GetSelf());
+                                                                auto ps_self = tyr.GetTyrPlayerStateFromObject(self);
 
                                                                 if (!ps_self || !ps_self->VehicleStatsAttribute)
                                                                     continue;
@@ -1106,17 +1179,10 @@ void Loop(UCanvas* Canvas) {
                         }
                     }
 
-                    if (bCanPenetrate) {
-                        Color = FLinearColors::Orange;
-                    }
-                    else if (bPlayerPartiallyVisible) {
-                        Color = FLinearColors::Green;
-                    }
-
                     const std::wstring vehicleName = GetVehicleDisplayName(player_ps);
                     const std::wstring display_str = BuildEntityLabel(vehicleName, self->K2_GetActorLocation(), rootPos);
 
-                    if (bPlayerPartiallyVisible && bIsEnemy)
+                    if (bHasTeamRelation && bPlayerPartiallyVisible && bIsEnemy)
                     {
                         visibleStatesThisFrame.insert(player_ps);
 
@@ -1127,8 +1193,8 @@ void Loop(UCanvas* Canvas) {
                         cachedInfo.VehicleName = vehicleName;
                         cachedInfo.HasLastKnownPosition = true;
 
-                        DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
-                        Canvas->K2_DrawText(get_roboto(), FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
+                        DrawPlayerBounds(Canvas, playerController, Player, Color, 1);
+                        DrawTextSafe(Canvas, FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
                     }
                     else
                     {
@@ -1142,8 +1208,8 @@ void Loop(UCanvas* Canvas) {
                             continue;
                         }
 
-                        DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
-                        Canvas->K2_DrawText(get_roboto(), FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
+                        DrawPlayerBounds(Canvas, playerController, Player, Color, 1);
+                        DrawTextSafe(Canvas, FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
                     }
                 }
             }
@@ -1159,7 +1225,9 @@ void Loop(UCanvas* Canvas) {
 
                 if (visibleStatesThisFrame.find(playerState) == visibleStatesThisFrame.end())
                 {
-                    DrawLastKnownEntity(Canvas, GetPlayerController(), self->K2_GetActorLocation(), it->second);
+                    LastSeenEntityInfo drawInfo = it->second;
+                    drawInfo.LastVisibleColor = GetRelationshipOverlayColor(self_ps, playerState);
+                    DrawLastKnownEntity(Canvas, playerController, self->K2_GetActorLocation(), drawInfo);
                 }
 
                 ++it;
