@@ -236,7 +236,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 camera_loc = GetFireOrigin(self);
             }
 
-            // 1. Target selection (Match 14cec50 FOV-based logic)
+            // 1. Target selection (FOV based only)
             if (!Target || !ISVALID(Target))
             {
                 DebugPrint("[Aim-Detail] Searching for new target...");
