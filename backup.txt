@@ -1,0 +1,860 @@
+#include "ESP.hpp"
+#include "SDK.hpp"
+#include "SDK/BPFL_VehicleUtils_classes.hpp"
+
+#include <Windows.h>
+#include <iostream>
+#include <chrono>
+#include <thread>
+#include <stdarg.h>
+#include <stdio.h>
+#include <map>
+#include <vector>
+
+using namespace SDK;
+
+SDK::ABP_BaseTank_C* Target = nullptr; // Global definition of Target
+bool bAimKeyDown = false;
+float bullet_speed = 10000;
+int head_bone = 0;
+UFont* font = nullptr;
+
+
+static __forceinline SDK::UTyrGameActionMessageStatics& GetTyrGameActionMessageStatics() { return *(SDK::UTyrGameActionMessageStatics*)SDK::UTyrGameActionMessageStatics::StaticClass(); };
+
+
+
+// Function definitions
+static void DebugPrintf(const char* fmt, ...)
+{
+    char buffer[1024];
+    char final_buffer[1024];
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    snprintf(final_buffer, sizeof(final_buffer), "[Empire] %s", buffer);
+    OutputDebugStringA(final_buffer);
+}
+
+static void SecureZeroMemoryCustom(void* pDest, size_t nSize)
+{
+    unsigned char* p = (unsigned char*)pDest;
+    for (size_t i = 0; i < nSize; i++)
+    {
+        p[i] = 0;
+    }
+}
+
+static void dbgprint(const char* string, ...)
+{
+    char buf[512];
+    va_list arg_list;
+
+    SecureZeroMemoryCustom(buf, sizeof(buf));
+
+    va_start(arg_list, string);
+    vsnprintf(buf, sizeof(buf), string, arg_list);
+    va_end(arg_list);
+
+    OutputDebugStringA(buf);
+}
+
+UWorld* GetWorld()
+{
+    return UWorld::GetWorld();
+}
+
+APlayerController* GetPlayerController()
+{
+    if (auto const World = UWorld::GetWorld();
+        World &&
+        World->OwningGameInstance &&
+        World->OwningGameInstance->LocalPlayers[0] &&
+        World->OwningGameInstance->LocalPlayers[0]->PlayerController)
+    {
+        return World->OwningGameInstance->LocalPlayers[0]->PlayerController;
+    }
+    return nullptr;
+}
+
+ABP_BaseTank_C* GetSelf()
+{
+    if (auto const PC = GetPlayerController();
+        PC &&
+        PC->Pawn &&
+        PC->Pawn->IsA(ABP_BaseTank_C::StaticClass()))
+    {
+        return (ABP_BaseTank_C*)PC->Pawn;
+    }
+    return nullptr;
+}
+
+UFont* get_roboto() {
+    if (!font) {
+        for (int i = 0; i < UObject::GObjects->Num(); ++i)
+        {
+            if (auto elem = UObject::GObjects->GetByIndex(i))
+            {
+                if (elem->IsA(UFont::StaticClass()))
+                {
+                    if (elem->GetName() == "Roboto") {
+                        font = static_cast<UFont*>(elem);
+                    }
+                }
+            }
+        }
+    }
+    return font;
+}
+
+bool IsValidScreenLoc(const FVector2D& Loc)
+{
+    return Loc.X >= 0 && Loc.Y >= 0;
+}
+bool IsValidScreenLoc(const FVector& Loc)
+{
+    return Loc.X >= 0 && Loc.Y >= 0 && Loc.Z > 0;
+}
+
+void DrawFilledCircle(FVector2D pos, float r, FLinearColor color, UGameViewportClient* ViewportClient, UCanvas* Canvas)
+{
+    float smooth = 0.07f;
+    int size = (int)(2.0f * PI / smooth) + 1;
+    float angle = 0.0f;
+    for (int i = 0; angle < 2 * PI; angle += smooth, i++)
+    {
+        Canvas->K2_DrawLine(FVector2D{ pos.X, pos.Y }, FVector2D{ pos.X + cosf(angle) * r, pos.Y + sinf(angle) * r }, 1.0f, color);
+    }
+}
+
+void DrawCircle(FVector2D pos, int radius, int numSides, FLinearColor Color, UGameViewportClient* ViewportClient, UCanvas* Canvas)
+{
+    float Step = PI * 2.0 / numSides;
+    int Count = 0;
+    FVector2D V[128];
+    for (float a = 0; a < PI * 2.0; a += Step) {
+        float X1 = radius * cos(a) + pos.X;
+        float Y1 = radius * sin(a) + pos.Y;
+        float X2 = radius * cos(a + Step) + pos.X;
+        float Y2 = radius * sin(a + Step) + pos.Y;
+        V[Count].X = X1;
+        V[Count].Y = Y1;
+        V[Count + 1].X = X2;
+        V[Count + 1].Y = Y2;
+        Canvas->K2_DrawLine(FVector2D{ V[Count].X, V[Count].Y }, FVector2D{ X2, Y2 }, 1.0f, Color);
+    }
+}
+
+void DrawLine(UCanvas* Canvas, int x, int y, int xx, int yy, const FLinearColor& RenderColor, int thicknes)
+{
+    Canvas->K2_DrawLine(FVector2D(x, y), FVector2D(xx, yy), thicknes, RenderColor);
+}
+
+void CornerBox(UCanvas* Canvas, int x, int y, int w, int h, int thickness, const FLinearColor& color)
+{
+    int bWidth = w;
+    int bHeight = h;
+    float constant = 3.5;
+
+    DrawLine(Canvas, x, y, x, y + (bHeight / constant), color, thickness);
+    DrawLine(Canvas, x, y, x + (bWidth / constant), y, color, thickness);
+    DrawLine(Canvas, x + bWidth, y, x + bWidth - (bWidth / constant), y, color, thickness);
+    DrawLine(Canvas, x + bWidth, y, x + bWidth, y + (bHeight / constant), color, thickness);
+    DrawLine(Canvas, x, y + bHeight, x + (bWidth / constant), y + bHeight, color, thickness);
+    DrawLine(Canvas, x, y + bHeight, x, y + bHeight - (bHeight / constant), color, thickness);
+    DrawLine(Canvas, x + bWidth, y + bHeight, x + bWidth - (bWidth / constant), y + bHeight, color, thickness);
+    DrawLine(Canvas, x + bWidth, y + bHeight, x + bWidth, y + bHeight - (bHeight / constant), color, thickness);
+}
+
+void DrawPlayerBounds(UCanvas* Canvas, APlayerController* PlayerController, SDK::ABP_BaseTank_C* Tank, const FLinearColor& color, int thickness) {
+
+    if (!Canvas || !PlayerController || !Tank) return;
+
+
+
+            auto ArmorMesh = Tank->GetArmorMesh();
+
+
+
+            if (!ArmorMesh) return;
+
+
+
+        
+
+
+
+            FVector Origin;
+
+
+
+            FVector BoxExtent;
+
+
+
+            UKismetSystemLibrary::GetComponentBounds(ArmorMesh, &Origin, &BoxExtent, nullptr);
+
+    FVector Corners[8];
+    Corners[0] = Origin + FVector(-BoxExtent.X, -BoxExtent.Y, -BoxExtent.Z);
+    Corners[1] = Origin + FVector(BoxExtent.X, -BoxExtent.Y, -BoxExtent.Z);
+    Corners[2] = Origin + FVector(BoxExtent.X, BoxExtent.Y, -BoxExtent.Z);
+    Corners[3] = Origin + FVector(-BoxExtent.X, BoxExtent.Y, -BoxExtent.Z);
+    Corners[4] = Origin + FVector(-BoxExtent.X, -BoxExtent.Y, BoxExtent.Z);
+    Corners[5] = Origin + FVector(BoxExtent.X, -BoxExtent.Y, BoxExtent.Z);
+    Corners[6] = Origin + FVector(BoxExtent.X, BoxExtent.Y, BoxExtent.Z);
+    Corners[7] = Origin + FVector(-BoxExtent.X, BoxExtent.Y, BoxExtent.Z);
+
+
+
+
+    FVector2D ScreenCorners[8];
+
+    float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+
+    bool bIsOnScreen = false;
+
+
+
+    for (int i = 0; i < 8; ++i)
+
+    {
+
+        if (PlayerController->ProjectWorldLocationToScreen(Corners[i], &ScreenCorners[i], true))
+
+        {
+
+            bIsOnScreen = true;
+
+            minX = min(minX, ScreenCorners[i].X);
+
+            minY = min(minY, ScreenCorners[i].Y);
+
+            maxX = max(maxX, ScreenCorners[i].X);
+
+            maxY = max(maxY, ScreenCorners[i].Y);
+
+        }
+
+    }
+
+
+
+    if (bIsOnScreen)
+
+    {
+
+        float Width = maxX - minX;
+
+        float Height = maxY - minY;
+
+        CornerBox(Canvas, minX, minY, Width, Height, thickness, color);
+
+    }
+
+}
+
+
+
+
+
+
+
+
+void Loop(UGameViewportClient* ViewportClient, UCanvas* Canvas) {
+    if (!GetPlayerController()) return;
+
+    FLinearColor Orange{ 1.0f, 0.5f, 0.0f, 1.0f };
+    std::wstring output = L"Enabled";
+    Canvas->K2_DrawText(get_roboto(), FString::FString(output.c_str()), FVector2D(60.f, 60.f), FVector2D(1, 1), Orange, 0, FLinearColor{ 0, 0, 0, 1 }, FVector2D(3, 3), 1, 0, 1, FLinearColor{ 0, 0, 0, 1 });
+
+    ABP_BaseTank_C* self = GetSelf();
+    if (!self) return;
+
+
+
+
+    auto pc = (SDK::ATyrPlayerControllerBase*)GetPlayerController();
+    if (GetAsyncKeyState(VK_NUMPAD3) & 0x8000)// Right mouse button for aimbot
+    {
+        DebugPrintf("Setting GAS!");
+        auto tyr = GetTyrGameActionMessageStatics();
+
+        pc->ServerChangeName(L"nothinghere");
+       
+
+
+
+        auto ps = tyr.GetTyrPlayerStateFromObject(GetSelf());
+
+        DebugPrintf("TyrPlayerState: %p", ps);
+
+       // ps->SetPlayerName(L"nothinghere");
+
+        ps->SetIsSpectatingBothTeams(true);
+        ps->bIsSpectatingBothTeams = true;
+      
+        ps->VehicleStatsAttribute->MaxSpeed.BaseValue = 100.f;
+        ps->VehicleStatsAttribute->MaxSpeed.CurrentValue = 100.f;
+
+        ps->VehicleStatsAttribute->ShellVelocity.CurrentValue = 10000.f;
+        ps->VehicleStatsAttribute->ShellVelocity.BaseValue = 10000.f;
+
+
+        ps->VehicleStatsAttribute->ShellDamage.CurrentValue = 500.f;
+        ps->VehicleStatsAttribute->ShellDamage.BaseValue = 500.f;
+
+        ps->VehicleStatsAttribute->ActiveReloadReductionTime.CurrentValue = 5.f;
+        ps->VehicleStatsAttribute->ActiveReloadReductionTime.BaseValue = 5.f;
+
+        ps->VehicleStatsAttribute->ReloadTime.CurrentValue = 2.f;
+        ps->VehicleStatsAttribute->ReloadTime.BaseValue = 2.f;
+
+        ps->VehicleStatsAttribute->ClipSize.CurrentValue = 2.f;
+        ps->VehicleStatsAttribute->ClipSize.BaseValue = 2.f;
+
+        ps->VehicleStatsAttribute->ThrottleMultiplier.CurrentValue = 10.f;
+        ps->VehicleStatsAttribute->ThrottleMultiplier.BaseValue = 10.f;
+
+
+        ps->VehicleStatsAttribute->ShellPenetration.CurrentValue = 120.f;
+        ps->VehicleStatsAttribute->ShellPenetration.BaseValue = 120.f;
+
+        
+
+
+        DebugPrintf("GAS Attributes set!");
+    }
+
+
+
+
+
+    static bool bBonesHaveBeenDumped = false;
+    if (GetAsyncKeyState(VK_NUMPAD0) & 0x8000)
+    {
+        if (!bBonesHaveBeenDumped)
+        {
+            DebugPrintf("Dumping bones from ArmorPartsMeshList...");
+            if (self && self->ArmorPartsMeshList.Num() > 0)
+            {
+                for (int i = 0; i < self->ArmorPartsMeshList.Num(); i++)
+                {
+                    UMeshComponent* MeshPart = self->ArmorPartsMeshList[i];
+                    if (MeshPart && MeshPart->IsA(USkeletalMeshComponent::StaticClass()))
+                    {
+                        auto SkelMeshPart = static_cast<USkeletalMeshComponent*>(MeshPart);
+                        DebugPrintf("[Part %d] Mesh: %s", i, SkelMeshPart->GetName().c_str());
+                        
+                        int32 NumBones = SkelMeshPart->GetNumBones();
+                        for (int32 j = 0; j < NumBones; j++)
+                        {
+                            FName BoneName = SkelMeshPart->GetBoneName(j);
+                            if (!BoneName.ToString().empty())
+                            {
+                                DebugPrintf("  [Bone %d] %s", j, BoneName.ToString().c_str());
+                            }
+                        }
+                    }
+                    else
+                    {
+                        DebugPrintf("[Part %d] Not a SkeletalMeshComponent.", i);
+                    }
+                }
+            }
+            else
+            {
+                DebugPrintf("ArmorPartsMeshList is empty or self is null.");
+            }
+            bBonesHaveBeenDumped = true;
+        }
+    }
+    else
+    {
+        bBonesHaveBeenDumped = false;
+    }
+
+
+
+
+
+
+    static bool bTeleportActive = false;
+    static std::map<ABP_BaseTank_C*, FVector> originalActorLocations;
+
+    if (GetAsyncKeyState('T') & 0x8000) // 'T' key is currently held down
+    {
+        if (!bTeleportActive) // First frame 'T' is pressed
+        {
+            bTeleportActive = true;
+            originalActorLocations.clear();
+
+            TArray<AActor*> OutActors{};
+            UGameplayStatics::GetAllActorsOfClass(UWorld::GetWorld(), ABP_BaseTank_C::StaticClass(), &OutActors);
+
+            for (AActor* Actor : OutActors)
+            {
+                auto const Player = (ABP_BaseTank_C*)Actor;
+                if (Player == self || !ISVALID(Player)) continue;
+
+                originalActorLocations[Player] = Player->K2_GetActorLocation();
+                Player->SetReplicates(false);
+                Player->SetReplicateMovement(false);
+            }
+        }
+
+        FVector forwardVec = self->GetActorForwardVector();
+        FVector startPos = self->K2_GetActorLocation() + (forwardVec * 2000.0f); // 20 meters
+        int count = 0;
+
+        for (auto const& [Player, OriginalLoc] : originalActorLocations)
+        {
+            if (ISVALID(Player))
+            {
+                FVector newPos = startPos + (forwardVec * count * 500.0f); // 5 meters apart
+                Player->K2_SetActorLocation(newPos, false, nullptr, true);
+                count++;
+            }
+        }
+    }
+    else // 'T' key is NOT held down
+    {
+        if (bTeleportActive) // First frame 'T' is released
+        {
+            bTeleportActive = false;
+
+            for (auto const& [Player, OriginalLoc] : originalActorLocations)
+            {
+                if (ISVALID(Player))
+                {
+                    Player->K2_SetActorLocation(OriginalLoc, false, nullptr, true);
+                    Player->SetReplicates(true);
+                    Player->SetReplicateMovement(true);
+                }
+            }
+            originalActorLocations.clear();
+        }
+    }
+
+	static std::wstring targetedBoneName = L"";
+	static FVector2D targetedBoneScreenLocation;
+	bool hasTargetedBoneThisFrame = false;
+
+    if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000)
+    {
+        auto tyr = GetTyrGameActionMessageStatics();
+        auto self_ps = tyr.GetTyrPlayerStateFromObject(GetSelf());
+        if (self_ps)
+        {
+            UWorld* World = GetWorld();
+            if (World)
+            {
+                ULevel* Level = World->PersistentLevel;
+                if (Level)
+                {
+                    TArray<AActor*>& Actors = Level->Actors;
+                    for (AActor* Actor : Actors)
+                    {
+                        if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
+                            continue;
+
+                        auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
+                        if (Player == self) continue;
+
+                        auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
+                        if (player_ps && player_ps->GetTeamId() != self_ps->GetTeamId())
+                        {
+                            // Found an enemy, switch to their team
+                            self_ps->MyTeamID.TeamId = player_ps->GetTeamId();
+                            break; // Exit after switching
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (GetAsyncKeyState(VK_NUMPAD5) & 0x8000)
+    {
+        auto self_sight_component = self->GetComponentByClass(UTyrPlayerSightComponent::StaticClass());
+        if (self_sight_component)
+        {
+            auto sight_comp = static_cast<UTyrPlayerSightComponent*>(self_sight_component);
+            auto spotted_effect = sight_comp->SpottedGamePlayEffectClass;
+
+            if (spotted_effect)
+            {
+                UWorld* World = GetWorld();
+                if (World)
+                {
+                    ULevel* Level = World->PersistentLevel;
+                    if (Level)
+                    {
+                        TArray<AActor*>& Actors = Level->Actors;
+                        for (AActor* Actor : Actors)
+                        {
+                            if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
+                                continue;
+
+                            auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
+                            if (Player == self) continue;
+
+                            auto player_sight_component = Player->GetComponentByClass(UTyrPlayerSightComponent::StaticClass());
+                            if (player_sight_component)
+                            {
+                                auto other_sight_comp = static_cast<UTyrPlayerSightComponent*>(player_sight_component);
+                                auto target_asc = other_sight_comp->AbilitySystemComponent;
+                                auto source_asc = sight_comp->AbilitySystemComponent;
+
+                                if (source_asc && target_asc)
+                                {
+                                    source_asc->BP_ApplyGameplayEffectToTarget(spotted_effect, target_asc, 1.0f, FGameplayEffectContextHandle());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (GetAsyncKeyState(VK_NUMPAD6))
+    {
+        DebugPrintf("VK_NUMPAD6 pressed.");
+        APlayerController* player_controller = GetPlayerController();
+        if (player_controller)
+        {
+            FVector camera_loc;
+            FRotator camera_rot;
+            player_controller->GetPlayerViewPoint(&camera_loc, &camera_rot);
+
+            FVector forward_vector = UKismetMathLibrary::GetForwardVector(camera_rot);
+            FVector trace_start = camera_loc; // Start trace from the camera location
+            FVector trace_end = trace_start + (forward_vector * 1000000.0f);
+            
+            TArray<FHitResult> AllHitResults;
+            bool bAnyHit = false;
+            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
+                self,
+                trace_start,
+                trace_end,
+                ETraceTypeQuery::TraceTypeQuery1,
+                GetWorld(),
+                &AllHitResults,
+                &bAnyHit
+            );
+
+            if (bAnyHit)
+            {
+                DebugPrintf("Line trace hit %d actors.", AllHitResults.Num());
+                for (const FHitResult& hit_result : AllHitResults)
+                {
+                    if (hit_result.bBlockingHit && hit_result.Component.Get())
+                    {
+                        AActor* hit_actor = hit_result.Component.Get()->GetOwner();
+                        if (hit_actor && hit_actor->IsA(ATyrWheeledVehiclePawnBase::StaticClass()))
+                        {
+                            DebugPrintf("Hit actor is a vehicle: %s", hit_actor->GetName().c_str());
+                            auto target_vehicle = static_cast<ATyrWheeledVehiclePawnBase*>(hit_actor);
+                            if (target_vehicle)
+                            {
+                                bool bSuccess = false;
+                                FVector OutTriangleNormal, OutTriangleLocation;
+                                FName ArmorName, ModuleName;
+                                FTyrArmorColor ArmorColorValue;
+                                FTyrModuleArmorColor ModuleColorValue;
+
+                                target_vehicle->GetArmorColorsFromHit_Implementation(hit_result, &bSuccess, &OutTriangleNormal, &OutTriangleLocation, &ArmorName, &ModuleName, &ArmorColorValue, &ModuleColorValue);
+
+                                if (bSuccess)
+                                {
+                                    int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
+                                    DebugPrintf("Armor info retrieved: %s (%dmm)", ArmorName.ToString().c_str(), armor_thickness);
+
+                                    std::string armor_name_str = ModuleName.ToString();
+                                    std::wstring armor_name_wstr(armor_name_str.begin(), armor_name_str.end());
+                                    std::wstring armor_info_str = L"Armor: " + armor_name_wstr + L" (" + std::to_wstring(armor_thickness) + L"mm)";
+                                    auto tyr = GetTyrGameActionMessageStatics();
+                                    auto ps_self = tyr.GetTyrPlayerStateFromObject(GetSelf());
+                                    auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.BaseValue;
+
+
+                                    if (self_pen  >= armor_thickness) {
+                                        DebugPrintf("Self Penetration: %fmm, Enemy Armor: (%dmm)", self_pen, armor_thickness);
+                                        GetSelf()->ActivateMainWeapon(true);
+                                        DebugPrintf("Activate weapon!");
+                                    }
+
+
+                                    int sx, sy;
+                                    player_controller->GetViewportSize(&sx, &sy);
+                                    FVector2D screen_center(sx / 2.0f, sy / 2.0f);
+
+                                    Canvas->K2_DrawText(get_roboto(), FString(armor_info_str.c_str()), screen_center, FVector2D(1.f, 1.f), FLinearColors::White, 1.0f, FLinearColor(0, 0, 0, 1), FVector2D(1, 1), true, true, true, FLinearColor(0, 0, 0, 0.7));
+                                    break; 
+                                }
+                                else
+                                {
+                                    DebugPrintf("GetArmorColorsFromHit_Implementation failed for %s.", hit_actor->GetName().c_str());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                DebugPrintf("Line trace did not hit anything.");
+            }
+        }
+    }
+
+	if (hasTargetedBoneThisFrame)
+	{
+		Canvas->K2_DrawText(get_roboto(), FString(targetedBoneName.c_str()), targetedBoneScreenLocation, FVector2D(1.f, 1.f), FLinearColors::Yellow, 1.0f, FLinearColor(0,0,0,1), FVector2D(1,1), true, true, true, FLinearColor(0,0,0,0.7));
+	}
+
+    UWorld* World = GetWorld();
+    if (World)
+    {
+        ULevel* Level = World->PersistentLevel;
+        if (Level)
+        {
+            TArray<AActor*>& Actors = Level->Actors;
+            for (AActor* Actor : Actors)
+            {
+                if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
+                    continue;
+
+                auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
+                if (Player == self || !Player->GetPhysicsMesh()) continue;
+
+
+
+                Player->VehicleStats->SpottedTime.CurrentValue = 99999.f;
+                Player->VehicleStats->SpottedTime.BaseValue = 99999.f;
+
+
+                FVector rootPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(0));
+                FVector headPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(6)); // Common head bone index
+
+                FVector2D rootScreen, headScreen;
+                
+                bool rootOnScreen = GetPlayerController()->ProjectWorldLocationToScreen(rootPos, &rootScreen, true);
+                bool headOnScreen = GetPlayerController()->ProjectWorldLocationToScreen(headPos, &headScreen, true);
+
+                if (rootOnScreen) // A single point on screen is enough to try drawing the box
+                {
+                    auto Color = FLinearColors::Red;
+                    
+                    FVector OutLocation;
+                    FRotator OutRotation;
+
+                    if (self) self->GetActorEyesViewPoint(&OutLocation, &OutRotation);
+                    else GetPlayerController()->GetActorEyesViewPoint(&OutLocation, &OutRotation);
+                    
+                    if (GetPlayerController()->LineOfSightTo(Player, OutLocation, false))
+                    {
+                        Color = FLinearColors::Green;
+                    }
+
+                    DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
+
+                    auto tyr = GetTyrGameActionMessageStatics();
+                    auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
+                    if (player_ps)
+                    {
+                        int32 teamId = player_ps->GetTeamId();
+                        std::wstring teamIdStr = L"Team: " + std::to_wstring(teamId);
+                        Canvas->K2_DrawText(get_roboto(), FString(teamIdStr.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+SDK::FVector Predict(SDK::FVector pos, SDK::FVector Velocity, float Distance, float BulletSpeed, float gravity_speed)
+{
+
+
+    // Validate Self
+    auto self = GetSelf();
+
+    // Calculate the time it takes for the bullet to reach the target
+    float Time = Distance / BulletSpeed;
+    SDK::FVector PredictedPos = pos + (Velocity * Time);
+    float BulletDrop = 0.5f * gravity_speed * (Time * Time);
+
+    if (gravity_speed > 1.0f)
+    {
+        // Apply a more aggressive scaling factor for FlyGravity > 1
+        PredictedPos.Z += BulletDrop * gravity_speed;
+    }
+
+    return PredictedPos;
+}
+
+
+
+
+
+
+
+
+void Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
+{
+    if (GetAsyncKeyState(0x4E)) // Right mouse button for aimbot
+    {
+        APlayerController* player_controller = GetPlayerController();
+        if (player_controller)
+        {
+            // Find best target
+            float best_fov = 200.0f; // Max FOV in pixels
+            ABP_BaseTank_C* target_actor_current = nullptr;
+            TArray<AActor*> actors;
+            UGameplayStatics::GetAllActorsOfClass(UWorld::GetWorld(), ABP_BaseTank_C::StaticClass(), &actors);
+
+            int sx, sy;
+            player_controller->GetViewportSize(&sx, &sy);
+            FVector2D screen_center(sx / 2.0f, sy / 2.0f);
+            ABP_BaseTank_C* self = GetSelf();
+
+            for (AActor* actor : actors)
+            {
+                auto player = (ABP_BaseTank_C*)actor;
+                if (player == self || !ISVALID(player)) continue;
+
+                FVector2D player_screen_pos;
+                if (player_controller->ProjectWorldLocationToScreen(player->K2_GetActorLocation(), &player_screen_pos, true))
+                {
+                    float fov_dist = screen_center.GetDistanceTo(player_screen_pos);
+                    if (fov_dist < best_fov)
+                    {
+                        best_fov = fov_dist;
+                        Target = player;
+                    }
+                }
+            }
+
+            if (Target)
+            {
+                auto armorMeshList = Target->ArmorPartsMeshList;
+                if (armorMeshList.Num() > 0)
+                {
+                    FVector camera_loc;
+                    FRotator camera_rot;
+                    player_controller->GetPlayerViewPoint(&camera_loc, &camera_rot);
+
+                    FVector best_bone_loc;
+                    int32 min_armor_thickness = 1000;
+                    FName best_bone_name;
+
+                    for (int i = 0; i < armorMeshList.Num(); i++)
+                    {
+                        UMeshComponent* MeshPart = armorMeshList[i];
+                        if (MeshPart && MeshPart->IsA(USkeletalMeshComponent::StaticClass()))
+                        {
+                            auto SkelMeshPart = static_cast<USkeletalMeshComponent*>(MeshPart);
+                            int32 NumBones = SkelMeshPart->GetNumBones();
+                            for (int32 j = 0; j < NumBones; j++)
+                            {
+                                FName BoneName = SkelMeshPart->GetBoneName(j);
+                                if (!BoneName.ToString().empty())
+                                {
+                                    FVector bone_world_loc = SkelMeshPart->GetSocketLocation(BoneName);
+                                    if (bone_world_loc.IsZero()) continue;
+
+                                    TArray<FHitResult> AllHitResults;
+                                    bool bAnyHit = false;
+                                    UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
+                                        self,
+                                        camera_loc,
+                                        bone_world_loc,
+                                        ETraceTypeQuery::TraceTypeQuery1,
+                                        GetWorld(),
+                                        &AllHitResults,
+                                        &bAnyHit
+                                    );
+
+                                    if (bAnyHit)
+                                    {
+                                        for (const FHitResult& hit_result : AllHitResults)
+                                        {
+                                            if (hit_result.bBlockingHit && hit_result.Component.Get())
+                                            {
+                                                AActor* hit_actor = hit_result.Component.Get()->GetOwner();
+                                                if (hit_actor == Target)
+                                                {
+                                                    bool bSuccess = false;
+                                                    FVector OutTriangleNormal, OutTriangleLocation;
+                                                    FName ArmorName, ModuleName;
+                                                    FTyrArmorColor ArmorColorValue;
+                                                    FTyrModuleArmorColor ModuleColorValue;
+
+                                                    Target->GetArmorColorsFromHit_Implementation(hit_result, &bSuccess, &OutTriangleNormal, &OutTriangleLocation, &ArmorName, &ModuleName, &ArmorColorValue, &ModuleColorValue);
+
+                                                    if (bSuccess)
+                                                    {
+                                                        int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
+                                                        if (armor_thickness < min_armor_thickness)
+                                                        {
+                                                            min_armor_thickness = armor_thickness;
+                                                            best_bone_loc = bone_world_loc;
+                                                            best_bone_name = BoneName;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!best_bone_loc.IsZero())
+                    {
+                        DebugPrintf("Best bone: %s, Armor: %d", best_bone_name.ToString().c_str(), min_armor_thickness);
+
+
+                        auto worldsettings = SDK::UWorld::GetWorld()->K2_GetWorldSettings();
+                        float WorldGravityZ = worldsettings->GlobalGravityZ;
+
+                        SDK::ACharacter* ACharacter = (SDK::ACharacter*)(Target);
+                        auto LastUpdateVelocity = ACharacter->CharacterMovement->LastUpdateVelocity;
+                        auto distance = GetPlayerController()->PlayerCameraManager->GetCameraLocation().GetDistanceTo(best_bone_loc);
+
+                        auto tyr = GetTyrGameActionMessageStatics();
+
+                        auto ps = tyr.GetTyrPlayerStateFromObject(GetSelf());
+
+                        auto b_speed = ps->VehicleStatsAttribute->ShellVelocity.BaseValue;
+
+                        auto predicted_loc = Predict(best_bone_loc, LastUpdateVelocity, distance, b_speed, WorldGravityZ);
+
+                        FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(camera_loc, predicted_loc);
+                        FRotator current_rotation = player_controller->ControlRotation;
+
+
+
+                        float interp_speed = 15.f;
+                        FRotator new_rotation = SDK::UKismetMathLibrary::RInterpTo(current_rotation, target_rotation, UGameplayStatics::GetWorldDeltaSeconds(self), interp_speed);
+                      //  GetSelf()->TurretComponent->bOverrideAim = true;
+                       GetSelf()->TurretComponent->OverrideAimRotation = new_rotation;
+                       // player_controller->SetControlRotation(new_rotation);
+                    }
+                }
+            }
+        }
+    }
+}
