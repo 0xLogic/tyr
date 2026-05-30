@@ -967,6 +967,8 @@ void Loop(UCanvas* Canvas) {
     UWorld* World = GetWorld();
     if (World)
     {
+        auto tyr = GetTyrGameActionMessageStatics();
+        auto self_ps = tyr.GetTyrPlayerStateFromObject(self);
         ULevel* Level = World->PersistentLevel;
         if (Level)
         {
@@ -980,12 +982,13 @@ void Loop(UCanvas* Canvas) {
                 auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
                 if (Player == self || !Player->GetPhysicsMesh()) continue;
 
-                auto tyr = GetTyrGameActionMessageStatics();
                 auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
                 if (!player_ps)
                 {
                     continue;
                 }
+
+                const bool bIsEnemy = self_ps && (player_ps->GetTeamId() != self_ps->GetTeamId());
 
                 if (Player->IsActorBeingDestroyed() || !IsTrackedPlayerAlive(player_ps))
                 {
@@ -1113,7 +1116,7 @@ void Loop(UCanvas* Canvas) {
                     const std::wstring vehicleName = GetVehicleDisplayName(player_ps);
                     const std::wstring display_str = BuildEntityLabel(vehicleName, self->K2_GetActorLocation(), rootPos);
 
-                    if (bPlayerPartiallyVisible)
+                    if (bPlayerPartiallyVisible && bIsEnemy)
                     {
                         visibleStatesThisFrame.insert(player_ps);
 
@@ -1127,8 +1130,18 @@ void Loop(UCanvas* Canvas) {
                         DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
                         Canvas->K2_DrawText(get_roboto(), FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
                     }
-                    else if (g_LastSeenEntityCache.find(player_ps) == g_LastSeenEntityCache.end())
+                    else
                     {
+                        if (!bIsEnemy)
+                        {
+                            g_LastSeenEntityCache.erase(player_ps);
+                        }
+
+                        if (g_LastSeenEntityCache.find(player_ps) != g_LastSeenEntityCache.end())
+                        {
+                            continue;
+                        }
+
                         DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
                         Canvas->K2_DrawText(get_roboto(), FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
                     }
