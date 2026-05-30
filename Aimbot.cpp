@@ -457,7 +457,8 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
                                 // Ensure Turret Component also snaps (if applicable)
                                 if (self->TurretComponent) {
-                                    self->TurretComponent->TargetTurretRotation = target_rotation;
+                                    // Use the game's native function to point the turret exactly at the 3D target location
+                                    self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
 
                                     // Tell the server exactly where in 3D space we are aiming for precise replication
                                     SDK::FVector_NetQuantize net_loc;
