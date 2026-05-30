@@ -9,7 +9,9 @@
 #include <thread>
 #include <stdarg.h>
 #include <stdio.h>
+#include <cmath>
 #include <map>
+#include <set>
 #include <vector>
 #include <fstream>
 
@@ -21,6 +23,118 @@ float bullet_speed = 10000;
 int head_bone = 0;
 UFont* font = nullptr;
 extern FName GunSocketName;
+
+namespace
+{
+    struct LastSeenEntityInfo
+    {
+        SDK::FVector LastRootWorld{};
+        SDK::FVector LastHeadWorld{};
+        SDK::FLinearColor LastVisibleColor{ 1.0f, 1.0f, 1.0f, 1.0f };
+        std::wstring VehicleName{};
+        bool HasLastKnownPosition = false;
+    };
+
+    static std::map<SDK::ATyrPlayerStateBase*, LastSeenEntityInfo> g_LastSeenEntityCache;
+
+    static bool IsTrackedPlayerAlive(SDK::ATyrPlayerStateBase* PlayerState)
+    {
+        if (!PlayerState || !ISVALID(PlayerState))
+        {
+            return false;
+        }
+
+        if (PlayerState->HealthComponent && ISVALID(PlayerState->HealthComponent))
+        {
+            return PlayerState->HealthComponent->IsAlive();
+        }
+
+        return PlayerState->IsAlive();
+    }
+
+    static std::wstring GetVehicleDisplayName(SDK::ATyrPlayerStateBase* PlayerState)
+    {
+        if (!PlayerState)
+        {
+            return L"Unknown";
+        }
+
+        std::string vehicleTag = PlayerState->VehicleTag.TagName.GetRawString();
+        std::wstring vehicleName(vehicleTag.begin(), vehicleTag.end());
+
+        const std::wstring prefix = L"Gameplay.Vehicle.";
+        if (vehicleName.rfind(prefix, 0) == 0)
+        {
+            vehicleName.erase(0, prefix.length());
+        }
+
+        if (vehicleName.empty())
+        {
+            vehicleName = L"Unknown";
+        }
+
+        return vehicleName;
+    }
+
+    static std::wstring BuildEntityLabel(const std::wstring& VehicleName, const SDK::FVector& SelfLocation, const SDK::FVector& EntityLocation)
+    {
+        wchar_t distanceBuffer[64]{};
+        swprintf(distanceBuffer, 64, L" | %.2fm", SelfLocation.GetDistanceToInMeters(EntityLocation));
+        return VehicleName + distanceBuffer;
+    }
+
+    static void DrawLastKnownEntity(UCanvas* Canvas, APlayerController* PlayerController, const SDK::FVector& SelfLocation, const LastSeenEntityInfo& CachedInfo)
+    {
+        if (!Canvas || !PlayerController || !CachedInfo.HasLastKnownPosition)
+        {
+            return;
+        }
+
+        SDK::FVector2D rootScreen{};
+        SDK::FVector2D headScreen{};
+
+        const bool rootOnScreen = PlayerController->ProjectWorldLocationToScreen(CachedInfo.LastRootWorld, &rootScreen, true);
+        const bool headOnScreen = PlayerController->ProjectWorldLocationToScreen(CachedInfo.LastHeadWorld, &headScreen, true);
+
+        SDK::FLinearColor drawColor = CachedInfo.LastVisibleColor;
+        drawColor.A = 0.85f;
+
+        if (rootOnScreen && headOnScreen)
+        {
+            float height = std::fabs(rootScreen.Y - headScreen.Y);
+            if (height < 8.0f)
+            {
+                height = 24.0f;
+            }
+
+            const float width = height * 0.45f;
+            const int x = static_cast<int>(rootScreen.X - (width * 0.5f));
+            const int y = static_cast<int>(headScreen.Y);
+            CornerBox(Canvas, x, y, static_cast<int>(width), static_cast<int>(height), 1, drawColor);
+        }
+
+        if (rootOnScreen)
+        {
+            DrawFilledCircle(rootScreen, 4.0f, drawColor, nullptr, Canvas);
+
+            const std::wstring displayText = BuildEntityLabel(CachedInfo.VehicleName, SelfLocation, CachedInfo.LastRootWorld) + L" [last]";
+            Canvas->K2_DrawText(
+                get_roboto(),
+                FString(displayText.c_str()),
+                SDK::FVector2D(rootScreen.X, rootScreen.Y + 15.0f),
+                SDK::FVector2D(1.0f, 1.0f),
+                drawColor,
+                1.0f,
+                SDK::FLinearColor{ 0, 0, 0, 1 },
+                SDK::FVector2D(0, 0),
+                true,
+                true,
+                true,
+                SDK::FLinearColor{ 0, 0, 0, 0.7f }
+            );
+        }
+    }
+}
 
 
 
@@ -853,9 +967,12 @@ void Loop(UCanvas* Canvas) {
     UWorld* World = GetWorld();
     if (World)
     {
+        auto tyr = GetTyrGameActionMessageStatics();
+        auto self_ps = tyr.GetTyrPlayerStateFromObject(self);
         ULevel* Level = World->PersistentLevel;
         if (Level)
         {
+            std::set<ATyrPlayerStateBase*> visibleStatesThisFrame;
             TArray<AActor*>& Actors = Level->Actors;
             for (AActor* Actor : Actors)
             {
@@ -864,6 +981,20 @@ void Loop(UCanvas* Canvas) {
 
                 auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
                 if (Player == self || !Player->GetPhysicsMesh()) continue;
+
+                auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
+                if (!player_ps)
+                {
+                    continue;
+                }
+
+                const bool bIsEnemy = self_ps && (player_ps->GetTeamId() != self_ps->GetTeamId());
+
+                if (Player->IsActorBeingDestroyed() || !IsTrackedPlayerAlive(player_ps))
+                {
+                    g_LastSeenEntityCache.erase(player_ps);
+                    continue;
+                }
 
 
                 FVector rootPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(0));
@@ -982,32 +1113,56 @@ void Loop(UCanvas* Canvas) {
                         Color = FLinearColors::Green;
                     }
 
-                    DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
+                    const std::wstring vehicleName = GetVehicleDisplayName(player_ps);
+                    const std::wstring display_str = BuildEntityLabel(vehicleName, self->K2_GetActorLocation(), rootPos);
 
-                    auto tyr = GetTyrGameActionMessageStatics();
-                    auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
-                    if (player_ps)
+                    if (bPlayerPartiallyVisible && bIsEnemy)
                     {
-                        std::string vtag_str = player_ps->VehicleTag.TagName.GetRawString();
-                        std::wstring vtag_wstr(vtag_str.begin(), vtag_str.end());
+                        visibleStatesThisFrame.insert(player_ps);
 
-                   
-                        auto distance = GetSelf()->K2_GetActorLocation().GetDistanceToInMeters(Player->K2_GetActorLocation());
-                        // Strip "Gameplay.Vehicle." from vtag_wstr
-                        const std::wstring prefix = L"Gameplay.Vehicle.";
-                        if (vtag_wstr.rfind(prefix, 0) == 0)
+                        auto& cachedInfo = g_LastSeenEntityCache[player_ps];
+                        cachedInfo.LastRootWorld = rootPos;
+                        cachedInfo.LastHeadWorld = headPos;
+                        cachedInfo.LastVisibleColor = Color;
+                        cachedInfo.VehicleName = vehicleName;
+                        cachedInfo.HasLastKnownPosition = true;
+
+                        DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
+                        Canvas->K2_DrawText(get_roboto(), FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
+                    }
+                    else
+                    {
+                        if (!bIsEnemy)
                         {
-                            vtag_wstr.erase(0, prefix.length());
+                            g_LastSeenEntityCache.erase(player_ps);
                         }
 
-                        // Build display string with reload time
-                        wchar_t reloadBuf[64];
-                        swprintf(reloadBuf, 64, L" | %.2fm", distance);
+                        if (g_LastSeenEntityCache.find(player_ps) != g_LastSeenEntityCache.end())
+                        {
+                            continue;
+                        }
 
-                        std::wstring display_str = vtag_wstr + reloadBuf;
+                        DrawPlayerBounds(Canvas, GetPlayerController(), Player, Color, 1);
                         Canvas->K2_DrawText(get_roboto(), FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15), FVector2D(1, 1), Color, 1.0f, FLinearColor{ 0, 0, 0, 1 }, FVector2D(0, 0), true, true, true, FLinearColor{ 0, 0, 0, 0.7 });
                     }
                 }
+            }
+
+            for (auto it = g_LastSeenEntityCache.begin(); it != g_LastSeenEntityCache.end();)
+            {
+                ATyrPlayerStateBase* playerState = it->first;
+                if (!IsTrackedPlayerAlive(playerState))
+                {
+                    it = g_LastSeenEntityCache.erase(it);
+                    continue;
+                }
+
+                if (visibleStatesThisFrame.find(playerState) == visibleStatesThisFrame.end())
+                {
+                    DrawLastKnownEntity(Canvas, GetPlayerController(), self->K2_GetActorLocation(), it->second);
+                }
+
+                ++it;
             }
         }
     }
