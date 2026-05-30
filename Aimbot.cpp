@@ -467,6 +467,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                     net_loc.Z = predicted_loc.Z;
                                     self->TurretComponent->Server_UpdateTurretParams(net_loc);
                                     
+                                    /* Disabled AutoLock for testing
                                     // Set the component to aim at locally
                                     if (!LockedBoneName.IsNone())
                                     {
@@ -479,6 +480,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                         self->TurretComponent->Server_SetAutoLockTarget(Target);
                                         CurrentServerAutoLockTarget = Target;
                                     }
+                                    */
                                 }
                             }
                         }
@@ -494,6 +496,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         Target = nullptr;
         LockedBoneName = FName();
 
+        /* Disabled AutoLock for testing
         ABP_BaseTank_C* self = GetSelf();
         if (self && self->TurretComponent)
         {
@@ -504,6 +507,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 CurrentServerAutoLockTarget = nullptr;
             }
         }
+        */
     }
 }
 
