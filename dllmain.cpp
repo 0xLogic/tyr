@@ -196,7 +196,6 @@ void DrawTransition(SDK::UGameViewportClient* ViewportClient /* this* */, SDK::U
     Loop(Canvas);
     Aimbot::Loop(Canvas);
     Aimbot::Aim( ViewportClient, Canvas);
-    Aimbot::AimMouse4(ViewportClient, Canvas);
 
     //    static void* PreviousNetDriver = nullptr;
 
