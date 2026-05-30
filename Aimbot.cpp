@@ -4,6 +4,7 @@
 #include "SDK/BPC_ShellFiringComponent_classes.hpp"
 #include "ESP.hpp"
 #include <Windows.h>
+#include <cmath>
 
 using namespace SDK;
 SDK::ABP_BaseTank_C* Target = nullptr; // Global definition of Target
@@ -14,6 +15,47 @@ static SDK::ABP_BaseTank_C* Mouse4Target = nullptr;
 static FName Mouse4LockedBoneName;
 static bool Mouse4DiagnosticsEnabled = true;
 static bool Mouse4DiagnosticsToggleWasDown = false;
+
+// Live-selectable look-at origin for A/B testing on slopes / in ADS.
+// F1 = MuzNorm (GetSuspensionAdjustedMuzzleTransform)
+// F2 = MuzNoTilt (NoTiltHack variant)
+// F3 = MuzForCam (ForCamera with current control rotation)
+// F4 = MuzSocket (VisualMesh->GetSocketLocation on BulletOriginSocket/GunSocket)
+// F5 = ActorLoc (K2_GetActorLocation — sanity check, expected to be wrong)
+// F6 = CameraLoc (PlayerCameraManager->GetCameraLocation — what ADS camera uses)
+static int FireOriginMode = 0;
+static bool FireOriginKeyWasDown[6] = { false, false, false, false, false, false };
+static const wchar_t* kFireOriginModeNames[6] = {
+    L"MuzNorm", L"MuzNoTilt", L"MuzForCam", L"MuzSocket", L"ActorLoc", L"CameraLoc"
+};
+
+// F7 toggles writing bOverrideAim/OverrideAimRotation directly instead of
+// going through SetTurretRotationFromTargetLocation. Theory: in ADS the
+// turret pipeline applies extra tilt-comp that doubles up with ours.
+static bool UseOverrideAim = false;
+static bool OverrideAimKeyWasDown = false;
+
+// F8 toggles subtracting HullTiltPitchAdjustment from the requested pitch
+// before SetControlRotation. Theory: the native StepPitchAndYawTowardsRotation
+// adds it as an input, so on a slope our requested pitch + hull adjustment
+// overshoots the target. Pre-subtracting cancels the double-add.
+static bool PreSubtractHullTilt = false;
+static bool HullTiltKeyWasDown = false;
+
+// F10 toggles converting the world-space aim rotation into the hull-local
+// "logical" frame via UTyrCameraFunctionLibrary::GetLogicalRotationFromCameraWorld
+// before SetControlRotation. Theory (from agent investigation): the control
+// rotation pipeline expects logical (hull-local) frame, not world. Our world
+// rotation gets re-converted incorrectly when the hull is tilted.
+static bool ConvertToLogical = false;
+static bool LogicalKeyWasDown = false;
+
+// F11 skips SetTurretRotationFromTargetLocation entirely. When F10 has already
+// pointed the camera correctly via logical conversion, the turret should follow
+// the camera on its own — and the explicit call may be fighting it with a
+// world-space target that over-elevates the gun on slopes.
+static bool SkipTurretCall = false;
+static bool SkipTurretKeyWasDown = false;
 
 static bool IsMouse4Down()
 {
@@ -44,6 +86,128 @@ static void SecureZeroMemoryCustom(void* pDest, size_t nSize)
     {
         p[i] = 0;
     }
+}
+
+// Pull the fire origin for the currently-selected FireOriginMode. Each mode is
+// a different theory for where the gun actually is on a tilted hull; numpad 1-5
+// switches at runtime so we can A/B them on a slope without rebuilding.
+// Falls back to the socket method if the selected source returns zero.
+static SDK::FVector GetFireOriginFromSocket(SDK::ABP_BaseTank_C* self)
+{
+    SDK::FName socket = GunSocketName;
+    if (self && self->ShellFiringComponent)
+    {
+        if (!self->ShellFiringComponent->BulletOriginSocket.IsNone())
+            socket = self->ShellFiringComponent->BulletOriginSocket;
+        else if (!self->ShellFiringComponent->GunSocket.IsNone())
+            socket = self->ShellFiringComponent->GunSocket;
+    }
+    if (self && self->VisualMesh && !socket.IsNone())
+        return self->VisualMesh->GetSocketLocation(socket);
+    return { 0.0, 0.0, 0.0 };
+}
+
+static SDK::FVector GetFireOrigin(SDK::ABP_BaseTank_C* self)
+{
+    if (!self) return { 0.0, 0.0, 0.0 };
+
+    SDK::FVector v = { 0.0, 0.0, 0.0 };
+    switch (FireOriginMode)
+    {
+    case 0:
+        if (self->TurretComponent)
+            v = self->TurretComponent->GetSuspensionAdjustedMuzzleTransform().Translation;
+        break;
+    case 1:
+        if (self->TurretComponent)
+            v = self->TurretComponent->GetSuspensionAdjustedMuzzleTransformNoTiltHack().Translation;
+        break;
+    case 2:
+    {
+        SDK::APlayerController* pc = GetPlayerController();
+        SDK::FRotator rot = pc ? pc->GetControlRotation() : SDK::FRotator{ 0, 0, 0 };
+        if (self->TurretComponent)
+            v = self->TurretComponent->GetSuspensionAdjustedMuzzleTransformForCamera(rot).Translation;
+        break;
+    }
+    case 3:
+        v = GetFireOriginFromSocket(self);
+        break;
+    case 4:
+        v = self->K2_GetActorLocation();
+        break;
+    case 5:
+    {
+        SDK::APlayerController* pc = GetPlayerController();
+        if (pc && pc->PlayerCameraManager)
+            v = pc->PlayerCameraManager->GetCameraLocation();
+        break;
+    }
+    }
+
+    if (v.IsZero())
+        v = GetFireOriginFromSocket(self);
+
+    return v;
+}
+
+static void UpdateFireOriginModeFromKeys()
+{
+    const int vk[6] = { VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6 };
+    for (int i = 0; i < 6; ++i)
+    {
+        const bool down = (GetAsyncKeyState(vk[i]) & 0x8000) != 0;
+        if (down && !FireOriginKeyWasDown[i])
+        {
+            FireOriginMode = i;
+            char narrow[64]{};
+            size_t conv = 0;
+            wcstombs_s(&conv, narrow, kFireOriginModeNames[i], _TRUNCATE);
+            DebugPrint("[FireOrigin] mode=%d (%s)", i, narrow);
+        }
+        FireOriginKeyWasDown[i] = down;
+    }
+
+    const bool override_down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (override_down && !OverrideAimKeyWasDown)
+    {
+        UseOverrideAim = !UseOverrideAim;
+        DebugPrint("[FireOrigin] UseOverrideAim=%d", UseOverrideAim ? 1 : 0);
+    }
+    OverrideAimKeyWasDown = override_down;
+
+    const bool tilt_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (tilt_down && !HullTiltKeyWasDown)
+    {
+        PreSubtractHullTilt = !PreSubtractHullTilt;
+        DebugPrint("[FireOrigin] PreSubtractHullTilt=%d", PreSubtractHullTilt ? 1 : 0);
+    }
+    HullTiltKeyWasDown = tilt_down;
+
+    const bool logical_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (logical_down && !LogicalKeyWasDown)
+    {
+        ConvertToLogical = !ConvertToLogical;
+        DebugPrint("[FireOrigin] ConvertToLogical=%d", ConvertToLogical ? 1 : 0);
+    }
+    LogicalKeyWasDown = logical_down;
+
+    const bool skip_turret_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (skip_turret_down && !SkipTurretKeyWasDown)
+    {
+        SkipTurretCall = !SkipTurretCall;
+        DebugPrint("[FireOrigin] SkipTurretCall=%d", SkipTurretCall ? 1 : 0);
+    }
+    SkipTurretKeyWasDown = skip_turret_down;
+}
+
+// Horizontal (XY) range — bullet time-of-flight scales with ground distance,
+// not slant range, so this avoids over-correcting drop on slopes.
+static float HorizontalDistance(const SDK::FVector& a, const SDK::FVector& b)
+{
+    SDK::FVector d = a - b;
+    d.Z = 0.0;
+    return (float)d.Magnitude();
 }
 
 
@@ -354,6 +518,18 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 {
                     auto player = (ABP_BaseTank_C*)actor;
                     if (player == self || !ISVALID(player)) continue;
+                    // Skip pure-deployable subclasses (no firing component or turret).
+                    if (!player->ShellFiringComponent || !player->TurretComponent) continue;
+                    // Skip non-combat subclasses by class name pattern. In single-player
+                    // most opponents are AI tanks (bIsABot=true) so we can't filter by
+                    // that, but Drone/SlowZone/Corpse subclasses are never real targets.
+                    {
+                        std::string cname = player->GetName();
+                        if (cname.find("Drone") != std::string::npos) continue;
+                        if (cname.find("SlowZone") != std::string::npos) continue;
+                        if (cname.find("Corpse") != std::string::npos) continue;
+                        if (cname.find("Zone") != std::string::npos) continue;
+                    }
 
                     FVector2D player_screen_pos;
                     if (player_controller->ProjectWorldLocationToScreen(player->K2_GetActorLocation(), &player_screen_pos, true))
@@ -370,7 +546,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
             if (Target)
             {
-                FVector camera_loc = self->VisualMesh->GetSocketLocation(GunSocketName);
+                FVector fire_origin = GetFireOrigin(self);
                 FVector best_bone_loc = { 0.f, 0.f, 0.f };
                 bool locked_bone_still_valid = false;
 
@@ -383,7 +559,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                     ActorsToIgnore.Add(self);
 
                     bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                        GetWorld(), camera_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
+                        GetWorld(), fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
                         ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
                         { 0,0,0,0 }, { 0,0,0,0 }, 0.f
                     );
@@ -421,8 +597,6 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                         FName best_module_bone_name;
                         FVector best_module_bone_loc = { 0.f, 0.f, 0.f };
 
-                        FVector muzzle_loc = self->VisualMesh->GetSocketLocation(GunSocketName);
-
                         for (int i = 0; i < armorMeshList.Num(); i++)
                         {
                             UMeshComponent* MeshPart = armorMeshList[i];
@@ -444,7 +618,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                         ActorsToIgnore.Add(self);
 
                                         bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                                            GetWorld(), camera_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
+                                            GetWorld(), fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
                                             ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
                                             { 0,0,0,0 }, { 0,0,0,0 }, 0.f
                                         );
@@ -463,7 +637,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                             TArray<FHitResult> AllHitResults;
                                             bool bAnyHit = false;
                                             UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                                                self, camera_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
+                                                self, fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
                                                 GetWorld(), &AllHitResults, &bAnyHit
                                             );
 
@@ -482,9 +656,9 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                                             int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
                                                             auto ps_self = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
                                                             if (!ps_self || !ps_self->VehicleStatsAttribute) continue;
-                                                            auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.BaseValue;
+                                                            auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.CurrentValue;
 
-                                                            float current_distance = muzzle_loc.GetDistanceTo(bone_world_loc);
+                                                            float current_distance = fire_origin.GetDistanceTo(bone_world_loc);
 
                                                             if (self_pen >= armor_thickness) {
                                                                 if (boneNameStr.find("thruster") != std::string::npos || boneNameStr.find("engine") != std::string::npos) {
@@ -540,38 +714,27 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
                     SDK::ACharacter* ACharacter = (SDK::ACharacter*)(Target);
 
-                    // 1. Safety Check for Character and Movement Component
                     if (ACharacter && ACharacter->CharacterMovement)
                     {
                         SDK::FVector LastUpdateVelocity = ACharacter->CharacterMovement->LastUpdateVelocity;
 
-                        // 2. Safety Check for PlayerController and Camera Manager
-                        if (player_controller && player_controller->PlayerCameraManager)
+                        auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
+                        if (ps && ps->VehicleStatsAttribute)
                         {
-                            SDK::FVector CameraLoc = player_controller->PlayerCameraManager->GetCameraLocation();
-                            float distance = CameraLoc.GetDistanceTo(best_bone_loc);
+                            float b_speed = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
 
-                            // 3. Safety Check for PlayerState and Attributes
-                            auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
-                            if (ps && ps->VehicleStatsAttribute)
-                            {
-                                float b_speed = ps->VehicleStatsAttribute->ShellVelocity.BaseValue;
+                            // Horizontal range for ballistic time-of-flight; aiming origin is the
+                            // suspension-adjusted muzzle so the gun, not the camera, points at target.
+                            float distance = HorizontalDistance(fire_origin, best_bone_loc);
+                            SDK::FVector predicted_loc = Predict(best_bone_loc, LastUpdateVelocity, distance, b_speed, WorldGravityZ);
+                            SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
 
-                                // 4. Calculate Prediction
-                                SDK::FVector predicted_loc = Predict(best_bone_loc, LastUpdateVelocity, distance, b_speed, WorldGravityZ);
+                            player_controller->SetControlRotation(target_rotation);
 
-                                // 5. Calculate Target Rotation
-                                SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(camera_loc, predicted_loc);
-
-                                // --- SNAP LOGIC ---
-                                // We skip RInterpTo and apply target_rotation directly for 0ms transition
-                                player_controller->SetControlRotation(target_rotation);
-
-                                // Ensure Turret Component also snaps (if applicable)
-                                if (self->TurretComponent) {
-                                    self->TurretComponent->TargetTurretRotation = target_rotation;
-
-                                }
+                            // Let the turret resolve pitch/yaw against current hull tilt rather than
+                            // jamming a world rotation into the hull-relative TargetTurretRotation slot.
+                            if (self->TurretComponent) {
+                                self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
                             }
                         }
                     }
@@ -592,6 +755,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 {
     HandleMouse4DiagnosticsToggle();
+    UpdateFireOriginModeFromKeys();
 
     if (!IsMouse4Down())
     {
@@ -651,6 +815,15 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         {
             auto player = (ABP_BaseTank_C*)actor;
             if (player == self || !ISVALID(player)) continue;
+            // Skip pure deployables and non-combat subclasses.
+            if (!player->ShellFiringComponent || !player->TurretComponent) continue;
+            {
+                std::string cname = player->GetName();
+                if (cname.find("Drone") != std::string::npos) continue;
+                if (cname.find("SlowZone") != std::string::npos) continue;
+                if (cname.find("Corpse") != std::string::npos) continue;
+                if (cname.find("Zone") != std::string::npos) continue;
+            }
 
             FVector2D player_screen_pos;
             if (player_controller->ProjectWorldLocationToScreen(player->K2_GetActorLocation(), &player_screen_pos, true))
@@ -687,7 +860,7 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         return;
     }
 
-    const FVector muzzle_loc = self->VisualMesh->GetSocketLocation(GunSocketName);
+    const FVector fire_origin = GetFireOrigin(self);
     FVector best_bone_loc = { 0.f, 0.f, 0.f };
     bool locked_bone_still_valid = false;
 
@@ -699,7 +872,7 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         ActorsToIgnore.Add(self);
 
         bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-            GetWorld(), muzzle_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
+            GetWorld(), fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
             ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
             { 0,0,0,0 }, { 0,0,0,0 }, 0.f
         );
@@ -728,9 +901,22 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         }
     }
 
+    int diag_armor_parts = 0;
+    int diag_bones_total = 0;
+    int diag_bones_visible = 0;
+    int diag_bones_any_hit = 0;
+    int diag_bones_hit_target = 0;
+    int diag_bones_armor_ok = 0;
+    int diag_bones_pen_pass = 0;
+    float diag_last_self_pen = -1.f;
+    int diag_last_armor_thickness = -1;
+    char diag_first_los_owner[64] = { 0 };
+    char diag_first_veh_owner[64] = { 0 };
+
     if (!locked_bone_still_valid)
     {
         auto armorMeshList = Mouse4Target->ArmorPartsMeshList;
+        diag_armor_parts = armorMeshList.Num();
         if (armorMeshList.Num() > 0)
         {
             int32 min_armor_thickness = 1000;
@@ -758,12 +944,14 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                             FVector bone_world_loc = SkelMeshPart->GetSocketLocation(BoneName);
                             if (bone_world_loc.IsZero()) continue;
 
+                            ++diag_bones_total;
+
                             TArray<FHitResult> LineOfSightHits;
                             TArray<AActor*> ActorsToIgnore;
                             ActorsToIgnore.Add(self);
 
                             bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                                GetWorld(), muzzle_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
+                                GetWorld(), fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
                                 ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
                                 { 0,0,0,0 }, { 0,0,0,0 }, 0.f
                             );
@@ -779,37 +967,70 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                     }
                                 }
                             }
+                            if (bIsVisible) ++diag_bones_visible;
+                            else if (diag_first_los_owner[0] == 0 && LineOfSightHits.Num() > 0)
+                            {
+                                const FHitResult& first_hit = LineOfSightHits[0];
+                                auto* comp = first_hit.Component.Get();
+                                AActor* owner_actor = comp ? comp->GetOwner() : nullptr;
+                                if (owner_actor)
+                                {
+                                    std::string owner_name = owner_actor->GetName();
+                                    strncpy_s(diag_first_los_owner, sizeof(diag_first_los_owner),
+                                        owner_name.c_str(), _TRUNCATE);
+                                }
+                            }
 
-                            if (bIsVisible)
+                            // Always proceed: the LOS gate above was rejecting all 51 bones
+                            // even with valid targets, so it's diagnostic-only now. The vehicle
+                            // trace is the game's own and is the real source of truth.
                             {
                                 TArray<FHitResult> AllHitResults;
                                 bool bAnyHit = false;
                                 UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                                    self, muzzle_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
+                                    self, fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
                                     GetWorld(), &AllHitResults, &bAnyHit
                                 );
 
                                 if (bAnyHit)
                                 {
+                                    ++diag_bones_any_hit;
+                                    if (diag_first_veh_owner[0] == 0 && AllHitResults.Num() > 0)
+                                    {
+                                        const FHitResult& first_hit = AllHitResults[0];
+                                        auto* comp = first_hit.Component.Get();
+                                        AActor* owner_actor = comp ? comp->GetOwner() : nullptr;
+                                        if (owner_actor)
+                                        {
+                                            std::string owner_name = owner_actor->GetName();
+                                            strncpy_s(diag_first_veh_owner, sizeof(diag_first_veh_owner),
+                                                owner_name.c_str(), _TRUNCATE);
+                                        }
+                                    }
                                     for (const FHitResult& hit_result : AllHitResults)
                                     {
                                         if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Mouse4Target)
                                         {
+                                            ++diag_bones_hit_target;
                                             bool bSuccess = false; FVector OutTriangleNormal, OutTriangleLocation; FName ArmorName, ModuleName;
                                             FTyrArmorColor ArmorColorValue; FTyrModuleArmorColor ModuleColorValue;
                                             Mouse4Target->GetArmorColorsFromHit_Implementation(hit_result, &bSuccess, &OutTriangleNormal, &OutTriangleLocation, &ArmorName, &ModuleName, &ArmorColorValue, &ModuleColorValue);
 
                                             if (bSuccess)
                                             {
+                                                ++diag_bones_armor_ok;
                                                 int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
                                                 auto ps_self = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
                                                 if (!ps_self || !ps_self->VehicleStatsAttribute) continue;
-                                                auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.BaseValue;
+                                                auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.CurrentValue;
+                                                diag_last_self_pen = (float)self_pen;
+                                                diag_last_armor_thickness = armor_thickness;
 
-                                                float current_distance = muzzle_loc.GetDistanceTo(bone_world_loc);
+                                                float current_distance = fire_origin.GetDistanceTo(bone_world_loc);
 
                                                 if (self_pen >= armor_thickness)
                                                 {
+                                                    ++diag_bones_pen_pass;
                                                     if (boneNameStr.find("thruster") != std::string::npos || boneNameStr.find("engine") != std::string::npos)
                                                     {
                                                         if (armor_thickness < min_module_armor_thickness || (armor_thickness == min_module_armor_thickness && current_distance < min_distance_to_thruster_engine))
@@ -857,8 +1078,28 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
     if (best_bone_loc.IsZero())
     {
-        emit_status(L"No valid bone lock for Mouse4.");
-        DebugPrint("[Mouse4] no valid bone lock");
+        wchar_t los_owner_w[64]{};
+        wchar_t veh_owner_w[64]{};
+        size_t conv = 0;
+        mbstowcs_s(&conv, los_owner_w, diag_first_los_owner[0] ? diag_first_los_owner : "-", _TRUNCATE);
+        mbstowcs_s(&conv, veh_owner_w, diag_first_veh_owner[0] ? diag_first_veh_owner : "-", _TRUNCATE);
+
+        wchar_t buf[512]{};
+        swprintf_s(buf,
+            L"No valid bone lock. parts=%d bones=%d vis=%d anyHit=%d hit=%d armorOK=%d penPass=%d pen=%.0f thick=%d losOwner=%s vehOwner=%s",
+            diag_armor_parts, diag_bones_total, diag_bones_visible, diag_bones_any_hit, diag_bones_hit_target,
+            diag_bones_armor_ok, diag_bones_pen_pass,
+            diag_last_self_pen, diag_last_armor_thickness,
+            los_owner_w, veh_owner_w);
+        emit_status(buf);
+        DebugPrint("[Mouse4] no valid bone lock parts=%d bones=%d vis=%d anyHit=%d hit=%d armorOK=%d penPass=%d pen=%.0f thick=%d losOwner=%s vehOwner=%s origin=(%.1f,%.1f,%.1f) target=%s",
+            diag_armor_parts, diag_bones_total, diag_bones_visible, diag_bones_any_hit, diag_bones_hit_target,
+            diag_bones_armor_ok, diag_bones_pen_pass,
+            diag_last_self_pen, diag_last_armor_thickness,
+            diag_first_los_owner[0] ? diag_first_los_owner : "-",
+            diag_first_veh_owner[0] ? diag_first_veh_owner : "-",
+            fire_origin.X, fire_origin.Y, fire_origin.Z,
+            Mouse4Target ? Mouse4Target->GetName().c_str() : "<null>");
         Mouse4Target = nullptr;
         Mouse4LockedBoneName = FName();
         return;
@@ -883,7 +1124,7 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
     }
 
     const SDK::FVector CameraLoc = player_controller->PlayerCameraManager->GetCameraLocation();
-    const float distance = muzzle_loc.GetDistanceTo(best_bone_loc);
+    const float distance = HorizontalDistance(fire_origin, best_bone_loc);
     const SDK::FRotator current_control_rotation = player_controller->GetControlRotation();
 
     auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
@@ -938,23 +1179,53 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         const SDK::FLinearColor spray_line_color = GetMouse4SprayColor(current_dispersion);
         const SDK::FLinearColor spray_delta_color = GetMouse4DeltaColor(spray_delta);
 
-        float b_speed = stats->ShellVelocity.BaseValue;
+        float b_speed = stats->ShellVelocity.CurrentValue;
 
         SDK::FVector predicted_loc = PredictMouse4(best_bone_loc, TargetVelocity, distance, b_speed, WorldGravityZ);
-        SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(CameraLoc, predicted_loc);
+        SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
 
-        player_controller->SetControlRotation(target_rotation);
+        if (PreSubtractHullTilt && self->TurretComponent)
+        {
+            target_rotation.Pitch -= self->TurretComponent->HullTiltPitchAdjustment;
+        }
+
+        // F10: convert world rotation to hull-local "logical" frame so the
+        // game's camera pipeline reinterprets it on slopes via the canonical
+        // GetLogicalRotationFromCameraWorld helper.
+        SDK::FRotator applied_rotation = target_rotation;
+        if (ConvertToLogical && self->TurretComponent)
+        {
+            SDK::FVector ground_normal = self->TurretComponent->FilteredSuspensionNormal;
+            if (ground_normal.IsZero())
+                ground_normal = SDK::FVector{ 0.0, 0.0, 1.0 };
+            applied_rotation = SDK::UTyrCameraFunctionLibrary::GetLogicalRotationFromCameraWorld(ground_normal, target_rotation);
+        }
+
+        player_controller->SetControlRotation(applied_rotation);
 
         if (self->TurretComponent)
         {
-            self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
+            if (UseOverrideAim)
+            {
+                self->TurretComponent->bOverrideAim = true;
+                self->TurretComponent->OverrideAimRotation = target_rotation;
+            }
+            else if (!SkipTurretCall)
+            {
+                self->TurretComponent->bOverrideAim = false;
+                self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
+            }
+            else
+            {
+                self->TurretComponent->bOverrideAim = false;
+            }
         }
 
         DebugPrint("[Mouse4] target=%s bone=%s camera=(%.1f,%.1f,%.1f) muzzle=(%.1f,%.1f,%.1f) boneLoc=(%.1f,%.1f,%.1f) pred=(%.1f,%.1f,%.1f) vel=(%.1f,%.1f,%.1f) ctrlRot=(%.1f,%.1f,%.1f) aimRot=(%.1f,%.1f,%.1f) dist=%.1f grav=%.1f",
             Mouse4Target->GetName().c_str(),
             Mouse4LockedBoneName.ToString().c_str(),
             CameraLoc.X, CameraLoc.Y, CameraLoc.Z,
-            muzzle_loc.X, muzzle_loc.Y, muzzle_loc.Z,
+            fire_origin.X, fire_origin.Y, fire_origin.Z,
             best_bone_loc.X, best_bone_loc.Y, best_bone_loc.Z,
             predicted_loc.X, predicted_loc.Y, predicted_loc.Z,
             TargetVelocity.X, TargetVelocity.Y, TargetVelocity.Z,
@@ -988,14 +1259,91 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 DrawMouse4DiagnosticLine(Canvas, 35.f, 220.f + (16.f * diag_line++), text, color);
             };
 
-            draw(L"[Mouse4 Diagnostics] (F9 toggle)", diag_color);
+            {
+                std::wstring header = L"[Mouse4 Diagnostics] (F9 toggle)  FireOrigin: ";
+                header += kFireOriginModeNames[FireOriginMode];
+                header += L"  (F1-F6)  OverrideAim: ";
+                header += (UseOverrideAim ? L"ON" : L"off");
+                header += L"  (F7)  PreSubTilt: ";
+                header += (PreSubtractHullTilt ? L"ON" : L"off");
+                header += L"  (F8)  Logical: ";
+                header += (ConvertToLogical ? L"ON" : L"off");
+                header += L"  (F10)  SkipTurret: ";
+                header += (SkipTurretCall ? L"ON" : L"off");
+                header += L"  (F11)";
+                draw(header, diag_color);
+            }
             draw(std::wstring(L"Target: ") + ToWide(Mouse4Target->GetName()), diag_color);
             draw(std::wstring(L"Bone: ") + ToWide(Mouse4LockedBoneName.ToString()), diag_color);
             draw(std::wstring(L"Camera: ") + FormatVectorWide(CameraLoc), diag_color);
-            draw(std::wstring(L"Muzzle: ") + FormatVectorWide(muzzle_loc), diag_color);
+            draw(std::wstring(L"Muzzle: ") + FormatVectorWide(fire_origin), diag_color);
             draw(std::wstring(L"BoneLoc: ") + FormatVectorWide(best_bone_loc), diag_color);
             draw(std::wstring(L"Pred: ") + FormatVectorWide(predicted_loc), diag_color);
             draw(std::wstring(L"Velocity: ") + FormatVectorWide(TargetVelocity), diag_color);
+            {
+                const double drop_z = (double)predicted_loc.Z - (double)best_bone_loc.Z;
+                double hull_tilt = 0.0;
+                double over_pitch = 0.0;
+                SDK::FVector muz_normal = { 0, 0, 0 };
+                SDK::FVector muz_notilt = { 0, 0, 0 };
+                SDK::FVector muz_forcam = { 0, 0, 0 };
+                if (self->TurretComponent)
+                {
+                    hull_tilt = self->TurretComponent->HullTiltPitchAdjustment;
+                    over_pitch = self->TurretComponent->CurrentOverPitch;
+                    muz_normal = self->TurretComponent->GetSuspensionAdjustedMuzzleTransform().Translation;
+                    muz_notilt = self->TurretComponent->GetSuspensionAdjustedMuzzleTransformNoTiltHack().Translation;
+                    muz_forcam = self->TurretComponent->GetSuspensionAdjustedMuzzleTransformForCamera(current_control_rotation).Translation;
+                }
+                SDK::FVector actor_loc = self->K2_GetActorLocation();
+                SDK::FVector muz_socket = { 0, 0, 0 };
+                if (self->VisualMesh && self->ShellFiringComponent)
+                {
+                    SDK::FName s = self->ShellFiringComponent->BulletOriginSocket;
+                    if (s.IsNone()) s = self->ShellFiringComponent->GunSocket;
+                    if (!s.IsNone()) muz_socket = self->VisualMesh->GetSocketLocation(s);
+                }
+                draw(std::wstring(L"ActorLoc: ") + FormatVectorWide(actor_loc), diag_color);
+                draw(std::wstring(L"MuzNorm:  ") + FormatVectorWide(muz_normal), diag_color);
+                draw(std::wstring(L"MuzNoTlt: ") + FormatVectorWide(muz_notilt), diag_color);
+                draw(std::wstring(L"MuzForCam:") + FormatVectorWide(muz_forcam), diag_color);
+                draw(std::wstring(L"MuzSocket:") + FormatVectorWide(muz_socket), diag_color);
+                if (self->TurretComponent)
+                {
+                    const SDK::FVector muz_msg = self->TurretComponent->LastGunLimitUpdateMessage.MuzzleTransform_41_421659BD45184E3D5766978443FD4064.Translation;
+                    draw(std::wstring(L"MuzMsg:   ") + FormatVectorWide(muz_msg), diag_color);
+                }
+                draw(std::wstring(L"Ballistic: bSpd=") + FormatDoubleWide(b_speed, 0) +
+                    L"  dropZ=" + FormatSignedDoubleWide(drop_z, 1) +
+                    L"  horizDist=" + FormatDoubleWide(distance, 0), diag_color);
+                // Real slope angle from filtered suspension normal — this is the
+                // actual hull tilt (HullTiltPitchAdjustment is not).
+                double slope_deg = 0.0;
+                SDK::FVector susp_normal = { 0, 0, 1 };
+                if (self->TurretComponent)
+                {
+                    susp_normal = self->TurretComponent->FilteredSuspensionNormal;
+                    double nz = susp_normal.Z;
+                    if (nz > 1.0) nz = 1.0;
+                    if (nz < -1.0) nz = -1.0;
+                    slope_deg = acos(nz) * 57.2957795131;
+                }
+                draw(std::wstring(L"HullTilt: pitchAdj=") + FormatSignedDoubleWide(hull_tilt, 2) +
+                    L"  overPitch=" + FormatSignedDoubleWide(over_pitch, 2) +
+                    L"  slopeDeg=" + FormatSignedDoubleWide(slope_deg, 2) +
+                    L"  N=" + FormatVectorWide(susp_normal), diag_color);
+
+                if (self->TurretComponent)
+                {
+                    const auto& msg = self->TurretComponent->LastGunLimitUpdateMessage;
+                    const bool at_limit = self->TurretComponent->bAtTurretLimit;
+                    draw(std::wstring(L"GunLimit: pitch=") + FormatSignedDoubleWide(msg.CurrentGunPitch_39_6FFEFCE047644FC1029C53AE38CDDB0C, 2) +
+                        L"  elev=" + FormatSignedDoubleWide(msg.GunElevationLimit_27_57A531F44D25AC2973CA9EAC05FC3FBB, 2) +
+                        L"  depr=" + FormatSignedDoubleWide(msg.GunDepressionLimit_28_31850A074304B819257A37AD67CBBB95, 2) +
+                        L"  msgHullTilt=" + FormatSignedDoubleWide(msg.HullTiltPitchAdjustment_44_A8557029495CFBE79645A580DCAFB01B, 2) +
+                        L"  atLimit=" + (at_limit ? L"YES" : L"no"), diag_color);
+                }
+            }
             draw(std::wstring(L"Spray: exact ") + FormatDoubleWide(current_dispersion) + L"  calc " + FormatDoubleWide(spray_calc) + L"  bloom " + FormatDoubleWide(shell_bloom), spray_line_color);
             draw(std::wstring(L"SprayDelta: ") + FormatSignedDoubleWide(spray_delta) + L"  |abs| " + FormatDoubleWide(spray_delta_abs), spray_delta_color);
             draw(std::wstring(L"SprayParts: base ") + FormatDoubleWide(base_dispersion) + L"  move " + FormatDoubleWide(movement_dispersion) + L"  hull " + FormatDoubleWide(hull_dispersion) + L"  turret " + FormatDoubleWide(turret_dispersion) + L"  fire " + FormatDoubleWide(firing_dispersion), diag_color);
