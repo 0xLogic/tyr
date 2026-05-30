@@ -7,6 +7,7 @@
 
 using namespace SDK;
 SDK::ABP_BaseTank_C* Target = nullptr; // Global definition of Target
+static SDK::ABP_BaseTank_C* CurrentServerAutoLockTarget = nullptr; // Track the server's known target
 static FName LockedBoneName;
 
 FName GunSocketName;
@@ -457,7 +458,19 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                 // Ensure Turret Component also snaps (if applicable)
                                 if (self->TurretComponent) {
                                     self->TurretComponent->TargetTurretRotation = target_rotation;
+                                    
+                                    // Set the component to aim at locally
+                                    if (!LockedBoneName.IsNone())
+                                    {
+                                        self->TurretComponent->AutoLockSocketname = LockedBoneName;
+                                    }
 
+                                    // Only update the server if the target changed
+                                    if (CurrentServerAutoLockTarget != Target)
+                                    {
+                                        self->TurretComponent->Server_SetAutoLockTarget(Target);
+                                        CurrentServerAutoLockTarget = Target;
+                                    }
                                 }
                             }
                         }
@@ -466,13 +479,23 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
             }
 
 
-}
         }
-    
+    }
     else
     {
         Target = nullptr;
         LockedBoneName = FName();
+
+        ABP_BaseTank_C* self = GetSelf();
+        if (self && self->TurretComponent)
+        {
+            if (CurrentServerAutoLockTarget != nullptr || !self->TurretComponent->AutoLockSocketname.IsNone())
+            {
+                self->TurretComponent->AutoLockSocketname = FName();
+                self->TurretComponent->Server_SetAutoLockTarget(nullptr);
+                CurrentServerAutoLockTarget = nullptr;
+            }
+        }
     }
 }
 
