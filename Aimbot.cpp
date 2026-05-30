@@ -458,6 +458,13 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                 // Ensure Turret Component also snaps (if applicable)
                                 if (self->TurretComponent) {
                                     self->TurretComponent->TargetTurretRotation = target_rotation;
+
+                                    // Tell the server exactly where in 3D space we are aiming for precise replication
+                                    SDK::FVector_NetQuantize net_loc;
+                                    net_loc.X = predicted_loc.X;
+                                    net_loc.Y = predicted_loc.Y;
+                                    net_loc.Z = predicted_loc.Z;
+                                    self->TurretComponent->Server_UpdateTurretParams(net_loc);
                                     
                                     // Set the component to aim at locally
                                     if (!LockedBoneName.IsNone())
