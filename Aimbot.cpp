@@ -109,7 +109,7 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
         if (!CurrentActor || CurrentActor == PlayerPawn) continue;
 
         auto TankActor = static_cast<SDK::ABP_BaseTank_C*>(CurrentActor);
-        if (!TankActor || !ISVALID(TankActor)) continue;
+        if (!TankActor) continue;
         
         auto ShellComp = TankActor->ShellFiringComponent;
         auto EnemyMesh = TankActor->VisualMesh;
@@ -157,17 +157,15 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
                 {
                     for (const FHitResult& hit_result : AllHitResults)
                     {
-                        if (hit_result.bBlockingHit) {
-                            if (hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == PlayerPawn)
-                            {
-                                bPlayerHitInLineOfSight = true;
-                            }
-                            break; // Stop at first blocking object
+                        if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == PlayerPawn)
+                        {
+                            bPlayerHitInLineOfSight = true;
+                            break;
                         }
                     }
                 }
 
-                if (bPlayerHitInLineOfSight)
+                if (bAnyHit && bPlayerHitInLineOfSight)
                 {
                     SDK::FLinearColor TextColor = { 1.f, 0.f, 0.f, 1.f };
                     Canvas->K2_DrawText(get_roboto(), FString(L"WARNING: YOU ARE BEING AIMED AT"), { (float)Canvas->ClipX / 2 - 150.f, 100.f }, { 1.5f, 1.5f }, TextColor, 1.f, { 0.f,0.f,0.f,1.f }, { 0,0 }, true, true, true, { 0.f,0.f,0.f,1.f });
@@ -201,12 +199,12 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
 
             if (bAnyHit) {
                 for (const FHitResult& hit_result : AllHitResults) {
-                    if (hit_result.bBlockingHit) {
+                    if (hit_result.bBlockingHit && hit_result.Component.Get()) {
                         LineEndLocation = hit_result.Location;
-                        if (hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == PlayerPawn) {
+                        if (hit_result.Component.Get()->GetOwner() == PlayerPawn) {
                             LineColor = { 0.f, 1.f, 0.f, 1.f }; 
                         }
-                        break; // Stop at first blocking object
+                        break; 
                     }
                 }
             }
@@ -233,10 +231,8 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 return;
             }
 
-            FVector fire_origin = GetFireOrigin(self);
-
             // Target selection logic
-            if (!Target || !ISVALID(Target))
+            if (!Target)
             {
                 DebugPrint("[Aim-Detail] Searching for new target...");
                 Target = nullptr;
@@ -250,15 +246,23 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 player_controller->GetViewportSize(&sx, &sy);
                 FVector2D screen_center(sx / 2.0f, sy / 2.0f);
 
+                DebugPrint("[Aim-Detail] Checked %d actors of class ABP_BaseTank_C", actors.Num());
+
                 for (AActor* actor : actors)
                 {
                     auto player = (ABP_BaseTank_C*)actor;
-                    if (!player || player == self || !ISVALID(player)) continue;
+                    if (!player || player == self) continue;
                     
-                    if (!player->ShellFiringComponent || !player->TurretComponent) continue;
+                    if (!player->ShellFiringComponent || !player->TurretComponent) {
+                        DebugPrint("[Aim-Detail] SKIP %s: Missing components", player->GetName().c_str());
+                        continue;
+                    }
 
                     std::string cname = player->GetName();
-                    if (cname.find("Corpse") != std::string::npos) continue;
+                    if (cname.find("Corpse") != std::string::npos) {
+                        DebugPrint("[Aim-Detail] SKIP %s: Non-combat subclass", cname.c_str());
+                        continue;
+                    }
 
                     FVector2D player_screen_pos;
                     if (player_controller->ProjectWorldLocationToScreen(player->K2_GetActorLocation(), &player_screen_pos, true))
@@ -266,31 +270,12 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                         float fov_dist = screen_center.GetDistanceTo(player_screen_pos);
                         if (fov_dist < best_fov)
                         {
-                            // Basic LOS check for target selection
-                            TArray<FHitResult> AllHitResults;
-                            bool bAnyHit = false;
-                            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                                self, fire_origin, player->K2_GetActorLocation(), ETraceTypeQuery::TraceTypeQuery1,
-                                GetWorld(), &AllHitResults, &bAnyHit
-                            );
-
-                            bool bVisible = false;
-                            if (bAnyHit) {
-                                for (const FHitResult& hit_result : AllHitResults) {
-                                    if (hit_result.bBlockingHit) {
-                                        if (hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == player) {
-                                            bVisible = true;
-                                        }
-                                        break; // Stop at first blocking object
-                                    }
-                                }
-                            }
-
-                            if (bVisible) {
-                                best_fov = fov_dist;
-                                Target = player;
-                            }
+                            best_fov = fov_dist;
+                            Target = player;
                         }
+                    }
+                    else {
+                        DebugPrint("[Aim-Detail] SKIP %s: Not on screen", cname.c_str());
                     }
                 }
 
@@ -298,10 +283,14 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 {
                     DebugPrint("[Aim-Detail] SELECTED: %s (FOV: %.1f)", Target->GetName().c_str(), best_fov);
                 }
+                else {
+                    DebugPrint("[Aim-Detail] FAIL: No suitable target found in FOV");
+                }
             }
 
             if (Target)
             {
+                FVector fire_origin = GetFireOrigin(self);
                 FVector best_bone_loc = { 0.f, 0.f, 0.f };
                 bool locked_bone_still_valid = false;
 
@@ -318,12 +307,10 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
                     if (bAnyHit) {
                         for (const FHitResult& hit_result : AllHitResults) {
-                            if (hit_result.bBlockingHit) {
-                                if (hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target) {
-                                    best_bone_loc = bone_world_loc;
-                                    locked_bone_still_valid = true;
-                                }
-                                break; // Stop at first blocking object
+                            if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target) {
+                                best_bone_loc = bone_world_loc;
+                                locked_bone_still_valid = true;
+                                break;
                             }
                         }
                     }
@@ -339,6 +326,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                     auto armorMeshList = Target->ArmorPartsMeshList;
                     if (armorMeshList.Num() > 0)
                     {
+                        DebugPrint("[Aim-Detail] Iterating %d armor parts for %s", armorMeshList.Num(), Target->GetName().c_str());
                         int32 min_armor_thickness = 1000;
                         int32 min_module_armor_thickness = 1000;
                         float min_distance_to_other = 999999.0f;
@@ -370,6 +358,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                         if (fallback_bone_name.IsNone()) {
                                             fallback_bone_name = BoneName;
                                             fallback_bone_loc = bone_world_loc;
+                                            DebugPrint("[Aim-Detail] Initial fallback set to: %s", boneNameStr.c_str());
                                         }
 
                                         TArray<FHitResult> AllHitResults;
@@ -382,55 +371,67 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                         bool bVisible = false;
                                         if (bAnyHit) {
                                             for (const FHitResult& hit_result : AllHitResults) {
-                                                if (hit_result.bBlockingHit) {
-                                                    if (hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target) {
-                                                        bVisible = true;
-                                                    }
-                                                    break; // Stop at first blocking object
+                                                if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target) {
+                                                    bVisible = true;
+                                                    break;
                                                 }
                                             }
                                         }
 
                                         if (bVisible)
                                         {
-                                            for (const FHitResult& hit_result : AllHitResults)
+                                            TArray<FHitResult> PenHitResults;
+                                            bool bPenAnyHit = false;
+                                            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
+                                                self, fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
+                                                GetWorld(), &PenHitResults, &bPenAnyHit
+                                            );
+
+                                            if (bPenAnyHit)
                                             {
-                                                if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target)
+                                                for (const FHitResult& hit_result : PenHitResults)
                                                 {
-                                                    bool bSuccess = false; FVector OutTriangleNormal, OutTriangleLocation; FName ArmorName, ModuleName;
-                                                    FTyrArmorColor ArmorColorValue; FTyrModuleArmorColor ModuleColorValue;
-                                                    Target->GetArmorColorsFromHit_Implementation(hit_result, &bSuccess, &OutTriangleNormal, &OutTriangleLocation, &ArmorName, &ModuleName, &ArmorColorValue, &ModuleColorValue);
-
-                                                    if (bSuccess)
+                                                    if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target)
                                                     {
-                                                        int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
-                                                        auto ps_self = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
-                                                        if (!ps_self || !ps_self->VehicleStatsAttribute) continue;
-                                                        auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.CurrentValue;
+                                                        bool bSuccess = false; FVector OutTriangleNormal, OutTriangleLocation; FName ArmorName, ModuleName;
+                                                        FTyrArmorColor ArmorColorValue; FTyrModuleArmorColor ModuleColorValue;
+                                                        Target->GetArmorColorsFromHit_Implementation(hit_result, &bSuccess, &OutTriangleNormal, &OutTriangleLocation, &ArmorName, &ModuleName, &ArmorColorValue, &ModuleColorValue);
 
-                                                        float current_distance = fire_origin.GetDistanceTo(bone_world_loc);
+                                                        if (bSuccess)
+                                                        {
+                                                            int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
+                                                            auto ps_self = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
+                                                            if (!ps_self || !ps_self->VehicleStatsAttribute) continue;
+                                                            auto self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.CurrentValue;
 
-                                                        if (self_pen >= armor_thickness) {
-                                                            if (boneNameStr.find("thruster") != std::string::npos || boneNameStr.find("engine") != std::string::npos) {
-                                                                if (armor_thickness < min_module_armor_thickness || (armor_thickness == min_module_armor_thickness && current_distance < min_distance_to_thruster_engine)) {
-                                                                    min_module_armor_thickness = armor_thickness;
-                                                                    min_distance_to_thruster_engine = current_distance;
-                                                                    best_module_bone_loc = bone_world_loc;
-                                                                    best_module_bone_name = BoneName;
+                                                            float current_distance = fire_origin.GetDistanceTo(bone_world_loc);
+
+                                                            if (self_pen >= armor_thickness) {
+                                                                if (boneNameStr.find("thruster") != std::string::npos || boneNameStr.find("engine") != std::string::npos) {
+                                                                    if (armor_thickness < min_module_armor_thickness || (armor_thickness == min_module_armor_thickness && current_distance < min_distance_to_thruster_engine)) {
+                                                                        min_module_armor_thickness = armor_thickness;
+                                                                        min_distance_to_thruster_engine = current_distance;
+                                                                        best_module_bone_loc = bone_world_loc;
+                                                                        best_module_bone_name = BoneName;
+                                                                    }
+                                                                }
+                                                                else {
+                                                                    if (armor_thickness < min_armor_thickness || (armor_thickness == min_armor_thickness && current_distance < min_distance_to_other))
+                                                                    {
+                                                                        min_armor_thickness = armor_thickness;
+                                                                        min_distance_to_other = current_distance;
+                                                                        best_bone_loc = bone_world_loc;
+                                                                        best_bone_name = BoneName;
+                                                                    }
                                                                 }
                                                             }
                                                             else {
-                                                                if (armor_thickness < min_armor_thickness || (armor_thickness == min_armor_thickness && current_distance < min_distance_to_other))
-                                                                {
-                                                                    min_armor_thickness = armor_thickness;
-                                                                    min_distance_to_other = current_distance;
-                                                                    best_bone_loc = bone_world_loc;
-                                                                    best_bone_name = BoneName;
-                                                                }
+                                                                // Verbose: Bone too thick
+                                                                if (j % 10 == 0) DebugPrint("[Aim-Detail] Bone %s: thickness %d > penetration %.0f", boneNameStr.c_str(), armor_thickness, self_pen);
                                                             }
                                                         }
+                                                        break;
                                                     }
-                                                    break; // Only check the first hit on the target for this bone
                                                 }
                                             }
                                         }
@@ -452,8 +453,11 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                         else if (!fallback_bone_name.IsNone()) {
                             best_bone_loc = fallback_bone_loc;
                             LockedBoneName = fallback_bone_name;
-                            DebugPrint("[Aim-Detail] FALLBACK LOCK: %s", LockedBoneName.ToString().c_str());
+                            DebugPrint("[Aim-Detail] FALLBACK LOCK: %s (No ideal bone found)", LockedBoneName.ToString().c_str());
                         }
+                    }
+                    else {
+                        DebugPrint("[Aim-Detail] FAIL: %s has no armor parts", Target->GetName().c_str());
                     }
                 }
 
@@ -482,19 +486,29 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                             applied_rotation = SDK::UTyrCameraFunctionLibrary::GetLogicalRotationFromCameraWorld(ground_normal, target_rotation);
                         }
 
+                        DebugPrint("[Aim-Detail] APPLYING: Target=%s | Bone=%s | Dist=%.0f | PredZ=%.1f | Rot=(P:%.1f, Y:%.1f)", 
+                            Target->GetName().c_str(), LockedBoneName.ToString().c_str(), distance, predicted_loc.Z, applied_rotation.Pitch, applied_rotation.Yaw);
+
                         player_controller->SetControlRotation(applied_rotation);
 
                         if (self->TurretComponent) {
                             self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
                         }
                     }
+                    else {
+                        DebugPrint("[Aim-Detail] FAIL: Missing vehicle stats for ballistic calculation");
+                    }
                 }
                 else
                 {
+                    DebugPrint("[Aim-Detail] FAIL: Final best_bone_loc is zero, clearing target");
                     Target = nullptr;
                     LockedBoneName = FName();
                 }
             }
+        }
+        else {
+            DebugPrint("[Aim-Detail] FAIL: player_controller is null");
         }
     }
     else
@@ -505,5 +519,18 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         }
         Target = nullptr;
         LockedBoneName = FName();
+
+        /* Disabled AutoLock for testing
+        ABP_BaseTank_C* self = GetSelf();
+        if (self && self->TurretComponent)
+        {
+            if (CurrentServerAutoLockTarget != nullptr || !self->TurretComponent->AutoLockSocketname.IsNone())
+            {
+                self->TurretComponent->AutoLockSocketname = FName();
+                self->TurretComponent->Server_SetAutoLockTarget(nullptr);
+                CurrentServerAutoLockTarget = nullptr;
+            }
+        }
+        */
     }
 }
