@@ -136,6 +136,154 @@ namespace
     }
 }
 
+SDK::FName ResolveGunSocketName()
+{
+    if (GunSocketName.IsNone())
+    {
+        GunSocketName = GetUKismetStringLibrary().Conv_StringToName(FString(L"jnt_muzzle"));
+    }
+
+    return GunSocketName;
+}
+
+SDK::FName GetVehicleGunSocketName(SDK::ABP_BaseTank_C* Vehicle)
+{
+    SDK::FName socketName = ResolveGunSocketName();
+
+    if (Vehicle && Vehicle->ShellFiringComponent)
+    {
+        if (!Vehicle->ShellFiringComponent->BulletOriginSocket.IsNone())
+        {
+            socketName = Vehicle->ShellFiringComponent->BulletOriginSocket;
+        }
+        else if (!Vehicle->ShellFiringComponent->GunSocket.IsNone())
+        {
+            socketName = Vehicle->ShellFiringComponent->GunSocket;
+        }
+    }
+
+    return socketName;
+}
+
+SDK::FVector GetVehicleFireOrigin(SDK::ABP_BaseTank_C* Vehicle)
+{
+    if (!Vehicle)
+    {
+        return { 0.0, 0.0, 0.0 };
+    }
+
+    SDK::FVector fireOrigin{ 0.0, 0.0, 0.0 };
+
+    if (Vehicle->TurretComponent)
+    {
+        fireOrigin = Vehicle->TurretComponent->GetSuspensionAdjustedMuzzleTransform().Translation;
+    }
+
+    if (fireOrigin.IsZero())
+    {
+        const SDK::FName socketName = GetVehicleGunSocketName(Vehicle);
+        if (Vehicle->VisualMesh && !socketName.IsNone())
+        {
+            fireOrigin = Vehicle->VisualMesh->GetSocketLocation(socketName);
+        }
+    }
+
+    if (fireOrigin.IsZero())
+    {
+        fireOrigin = Vehicle->K2_GetActorLocation();
+    }
+
+    return fireOrigin;
+}
+
+bool TraceVehicleHits(
+    SDK::ABP_BaseTank_C* SourceVehicle,
+    const SDK::FVector& Start,
+    const SDK::FVector& End,
+    TArray<SDK::FHitResult>* OutHitResults)
+{
+    if (OutHitResults != nullptr)
+    {
+        OutHitResults->Clear();
+    }
+
+    if (!SourceVehicle)
+    {
+        return false;
+    }
+
+    UWorld* const world = GetWorld();
+    if (!world)
+    {
+        return false;
+    }
+
+    TArray<SDK::FHitResult> hitResults;
+    bool bDidHitAnything = false;
+    UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
+        SourceVehicle,
+        Start,
+        End,
+        ETraceTypeQuery::TraceTypeQuery1,
+        world,
+        &hitResults,
+        &bDidHitAnything
+    );
+
+    if (OutHitResults != nullptr)
+    {
+        *OutHitResults = hitResults;
+    }
+
+    return bDidHitAnything;
+}
+
+bool TraceVehicleVisibility(
+    SDK::ABP_BaseTank_C* SourceVehicle,
+    const SDK::FVector& Start,
+    const SDK::FVector& End,
+    SDK::AActor* TargetActor,
+    TArray<SDK::FHitResult>* OutHitResults)
+{
+    if (!TargetActor)
+    {
+        if (OutHitResults != nullptr)
+        {
+            OutHitResults->Clear();
+        }
+
+        return false;
+    }
+
+    TArray<SDK::FHitResult> hitResults;
+    if (!TraceVehicleHits(SourceVehicle, Start, End, &hitResults))
+    {
+        if (OutHitResults != nullptr)
+        {
+            *OutHitResults = hitResults;
+        }
+
+        return false;
+    }
+
+    if (OutHitResults != nullptr)
+    {
+        *OutHitResults = hitResults;
+    }
+
+    for (const SDK::FHitResult& hitResult : hitResults)
+    {
+        if (hitResult.bBlockingHit &&
+            hitResult.Component.Get() &&
+            hitResult.Component.Get()->GetOwner() == TargetActor)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 
 
 
@@ -874,16 +1022,7 @@ void Loop(UCanvas* Canvas) {
             FVector trace_end = trace_start + (forward_vector * 1000000.0f);
 
             TArray<FHitResult> AllHitResults;
-            bool bAnyHit = false;
-            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                self,
-                trace_start,
-                trace_end,
-                ETraceTypeQuery::TraceTypeQuery1,
-                GetWorld(),
-                &AllHitResults,
-                &bAnyHit
-            );
+            const bool bAnyHit = TraceVehicleHits(self, trace_start, trace_end, &AllHitResults);
 
             if (bAnyHit)
             {
@@ -1011,7 +1150,7 @@ void Loop(UCanvas* Canvas) {
                     bool bPlayerPartiallyVisible = false;
                     bool bCanPenetrate = false;
 
-                    FVector muzzle_loc = self->VisualMesh->GetSocketLocation(GunSocketName);
+                    const FVector muzzle_loc = GetVehicleFireOrigin(self);
                     if (!muzzle_loc.IsZero())
                     {
                         if (Player->ArmorPartsMeshList.Num() > 0)
@@ -1032,23 +1171,12 @@ void Loop(UCanvas* Canvas) {
                                             if (bone_world_loc.IsZero()) continue;
 
                                             TArray<FHitResult> LineOfSightHits;
-                                            TArray<AActor*> ActorsToIgnore;
-                                            ActorsToIgnore.Add(self);
-
-                                            bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                                                GetWorld(), muzzle_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false, ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true, { 0,0,0,0 }, { 0,0,0,0 }, 0.f
-                                            );
-
-                                            bool bIsBoneVisible = false;
-                                            if (!bLineOfSightHit) {
-                                                bIsBoneVisible = true;
-                                            }
-                                            else {
-                                                for (const FHitResult& los_hit : LineOfSightHits) {
-                                                    if (los_hit.bBlockingHit && los_hit.Component.Get() && los_hit.Component.Get()->GetOwner() == Player) {
-                                                        bIsBoneVisible = true;
-                                                        break;
-                                                    }
+                                            bool bIsBoneVisible = TraceVehicleVisibility(self, muzzle_loc, bone_world_loc, Player, &LineOfSightHits);
+                                            if (!bIsBoneVisible)
+                                            {
+                                                if (APlayerController* const playerController = GetPlayerController())
+                                                {
+                                                    bIsBoneVisible = playerController->LineOfSightTo(Player, muzzle_loc, false);
                                                 }
                                             }
 
@@ -1057,14 +1185,9 @@ void Loop(UCanvas* Canvas) {
                                                 bPlayerPartiallyVisible = true;
 
                                                 // Now check for penetration
-                                                TArray<FHitResult> ArmorHitResults;
-                                                bool bArmorHit = UKismetSystemLibrary::LineTraceMulti(
-                                                    GetWorld(), muzzle_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false, ActorsToIgnore, EDrawDebugTrace::None, &ArmorHitResults, true, { 0,0,0,0 }, { 0,0,0,0 }, 0.f
-                                                );
-
-                                                if (bArmorHit)
+                                                if (LineOfSightHits.Num() > 0)
                                                 {
-                                                    for (const FHitResult& hit_result : ArmorHitResults)
+                                                    for (const FHitResult& hit_result : LineOfSightHits)
                                                     {
                                                         if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Player)
                                                         {

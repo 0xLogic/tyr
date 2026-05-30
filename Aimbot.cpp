@@ -51,36 +51,6 @@ static SDK::FVector Predict(const SDK::FVector& pos, const SDK::FVector& velocit
     return predictedPos;
 }
 
-// Fire origin logic from the investigation branch (MuzNorm + Socket fallback)
-static SDK::FVector GetFireOrigin(SDK::ABP_BaseTank_C* self)
-{
-    if (!self) return { 0.0, 0.0, 0.0 };
-
-    SDK::FVector v = { 0.0, 0.0, 0.0 };
-    
-    if (self->TurretComponent)
-        v = self->TurretComponent->GetSuspensionAdjustedMuzzleTransform().Translation;
-
-    if (v.IsZero())
-    {
-        SDK::FName socket = GunSocketName;
-        if (self->ShellFiringComponent)
-        {
-            if (!self->ShellFiringComponent->BulletOriginSocket.IsNone())
-                socket = self->ShellFiringComponent->BulletOriginSocket;
-            else if (!self->ShellFiringComponent->GunSocket.IsNone())
-                socket = self->ShellFiringComponent->GunSocket;
-        }
-        if (self->VisualMesh && !socket.IsNone())
-            v = self->VisualMesh->GetSocketLocation(socket);
-    }
-
-    if (v.IsZero())
-        v = self->K2_GetActorLocation();
-
-    return v;
-}
-
 static float HorizontalDistance(const SDK::FVector& a, const SDK::FVector& b)
 {
     SDK::FVector d = a - b;
@@ -113,14 +83,17 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
         
         auto ShellComp = TankActor->ShellFiringComponent;
         auto EnemyMesh = TankActor->VisualMesh;
-
-        FString boneName = L"jnt_muzzle";
-        GunSocketName = GetUKismetStringLibrary().Conv_StringToName(boneName);
+        const FName gunSocketName = GetVehicleGunSocketName(TankActor);
 
         if (ShellComp && EnemyMesh)
         {
-            FVector EnemyGunLocation = EnemyMesh->GetSocketLocation(GunSocketName);
-            FRotator EnemyGunRotation = EnemyMesh->GetSocketRotation(GunSocketName);
+            FVector EnemyGunLocation = GetVehicleFireOrigin(TankActor);
+            FRotator EnemyGunRotation = TankActor->K2_GetActorRotation();
+
+            if (!gunSocketName.IsNone())
+            {
+                EnemyGunRotation = EnemyMesh->GetSocketRotation(gunSocketName);
+            }
 
             FVector EnemyGunForward = GetKismetMathLibrary().GetForwardVector(EnemyGunRotation);
             FVector PlayerLocation = PlayerPawn->K2_GetActorLocation();
@@ -128,44 +101,11 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
             FVector DirToPlayer = PlayerLocation - EnemyGunLocation;
             DirToPlayer.Normalize();
 
-            FVector OutLocation;
-            FRotator OutRotation;
-            if (TankActor->PlayerController)
-                TankActor->PlayerController->GetActorEyesViewPoint(&OutLocation, &OutRotation);
-
             double DotProduct = GetKismetMathLibrary().Dot_VectorVector(EnemyGunForward, DirToPlayer);
 
             if (DotProduct > 0.99)
             {
-                TArray<FHitResult> AllHitResults;
-                bool bAnyHit = false;
-                TArray<AActor*> ActorsToIgnore;
-                ActorsToIgnore.Add(TankActor);
-
-                UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                    TankActor, 
-                    OutLocation,
-                    PlayerLocation,
-                    ETraceTypeQuery::TraceTypeQuery1,
-                    World,
-                    &AllHitResults,
-                    &bAnyHit
-                );
-
-                bool bPlayerHitInLineOfSight = false;
-                if (bAnyHit)
-                {
-                    for (const FHitResult& hit_result : AllHitResults)
-                    {
-                        if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == PlayerPawn)
-                        {
-                            bPlayerHitInLineOfSight = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (bAnyHit && bPlayerHitInLineOfSight)
+                if (TraceVehicleVisibility(TankActor, EnemyGunLocation, PlayerLocation, PlayerPawn))
                 {
                     SDK::FLinearColor TextColor = { 1.f, 0.f, 0.f, 1.f };
                     Canvas->K2_DrawText(get_roboto(), FString(L"WARNING: YOU ARE BEING AIMED AT"), { (float)Canvas->ClipX / 2 - 150.f, 100.f }, { 1.5f, 1.5f }, TextColor, 1.f, { 0.f,0.f,0.f,1.f }, { 0,0 }, true, true, true, { 0.f,0.f,0.f,1.f });
@@ -176,23 +116,18 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
         auto Mesh = TankActor->VisualMesh;
         if (Mesh)
         {
-            SDK::FVector SocketLocation = Mesh->GetSocketLocation(GunSocketName);
-            SDK::FRotator SocketRotation = Mesh->GetSocketRotation(GunSocketName);
+            SDK::FVector SocketLocation = GetVehicleFireOrigin(TankActor);
+            SDK::FRotator SocketRotation = TankActor->K2_GetActorRotation();
+
+            if (!gunSocketName.IsNone())
+            {
+                SocketRotation = Mesh->GetSocketRotation(gunSocketName);
+            }
 
             SDK::FVector EndLocation = SocketLocation + GetKismetMathLibrary().GetForwardVector(SocketRotation) * 10000.f;
 
             TArray<FHitResult> AllHitResults;
-            bool bAnyHit = false;
-
-            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                CurrentActor, 
-                SocketLocation,
-                EndLocation,
-                ETraceTypeQuery::TraceTypeQuery1,
-                World,
-                &AllHitResults,
-                &bAnyHit
-            );
+            const bool bAnyHit = TraceVehicleHits(TankActor, SocketLocation, EndLocation, &AllHitResults);
 
             SDK::FVector LineEndLocation = EndLocation;
             SDK::FLinearColor LineColor = { 1.f, 0.f, 0.f, 1.f };
@@ -290,29 +225,18 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
             if (Target)
             {
-                FVector fire_origin = GetFireOrigin(self);
+                FVector fire_origin = GetVehicleFireOrigin(self);
                 FVector best_bone_loc = { 0.f, 0.f, 0.f };
                 bool locked_bone_still_valid = false;
 
                 if (!LockedBoneName.IsNone())
                 {
                     FVector bone_world_loc = Target->VisualMesh->GetSocketLocation(LockedBoneName);
-                    
-                    TArray<FHitResult> AllHitResults;
-                    bool bAnyHit = false;
-                    UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                        self, fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
-                        GetWorld(), &AllHitResults, &bAnyHit
-                    );
 
-                    if (bAnyHit) {
-                        for (const FHitResult& hit_result : AllHitResults) {
-                            if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target) {
-                                best_bone_loc = bone_world_loc;
-                                locked_bone_still_valid = true;
-                                break;
-                            }
-                        }
+                    locked_bone_still_valid = TraceVehicleVisibility(self, fire_origin, bone_world_loc, Target);
+                    if (locked_bone_still_valid)
+                    {
+                        best_bone_loc = bone_world_loc;
                     }
 
                     if (!locked_bone_still_valid) {
@@ -361,33 +285,12 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                             DebugPrint("[Aim-Detail] Initial fallback set to: %s", boneNameStr.c_str());
                                         }
 
-                                        TArray<FHitResult> AllHitResults;
-                                        bool bAnyHit = false;
-                                        UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                                            self, fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
-                                            GetWorld(), &AllHitResults, &bAnyHit
-                                        );
-
-                                        bool bVisible = false;
-                                        if (bAnyHit) {
-                                            for (const FHitResult& hit_result : AllHitResults) {
-                                                if (hit_result.bBlockingHit && hit_result.Component.Get() && hit_result.Component.Get()->GetOwner() == Target) {
-                                                    bVisible = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
+                                        TArray<FHitResult> PenHitResults;
+                                        const bool bVisible = TraceVehicleVisibility(self, fire_origin, bone_world_loc, Target, &PenHitResults);
 
                                         if (bVisible)
                                         {
-                                            TArray<FHitResult> PenHitResults;
-                                            bool bPenAnyHit = false;
-                                            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                                                self, fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1,
-                                                GetWorld(), &PenHitResults, &bPenAnyHit
-                                            );
-
-                                            if (bPenAnyHit)
+                                            if (PenHitResults.Num() > 0)
                                             {
                                                 for (const FHitResult& hit_result : PenHitResults)
                                                 {
