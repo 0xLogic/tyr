@@ -143,6 +143,7 @@
     <ClCompile Include="SDK\Basic.cpp" />
     <ClCompile Include="SDK\BPFL_VehicleUtils_functions.cpp" />
     <ClCompile Include="SDK\BP_BaseTank_functions.cpp" />
+    <ClCompile Include="SDK\BPC_TurretBaseComponent_functions.cpp" />
     <ClCompile Include="SDK\CoreUObject_functions.cpp" />
     <ClCompile Include="SDK\Engine_functions.cpp" />
     <ClCompile Include="SDK\GameplayAbilities_functions.cpp" />
