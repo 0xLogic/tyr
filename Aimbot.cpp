@@ -218,7 +218,13 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
             if (!self) return;
 
             // Target selection logic
-            if (!Target) // If no target or target is dead, find a new one
+            if (Target && !ISVALID(Target))
+            {
+                Target = nullptr;
+                LockedBoneName = FName();
+            }
+
+            if (!Target) // If no target, find a new one
             {
                 Target = nullptr;
                 LockedBoneName = FName();
@@ -410,7 +416,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
                 if (best_bone_loc.IsZero())
                 {
-                    Target = nullptr;
+                    // Keep Target so we don't snap to a new one if this one hides
                     LockedBoneName = FName();
                 }
 
