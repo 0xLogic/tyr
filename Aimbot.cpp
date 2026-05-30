@@ -227,13 +227,18 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         {
             ABP_BaseTank_C* self = GetSelf();
             if (!self) {
-                DebugPrint("[Aim-Detail] FAIL: self is null");
                 return;
             }
 
-            FVector fire_origin = GetFireOrigin(self);
+            SDK::FVector camera_loc = { 0.f, 0.f, 0.f };
+            if (player_controller->PlayerCameraManager) {
+                camera_loc = player_controller->PlayerCameraManager->GetCameraLocation();
+            }
+            if (camera_loc.IsZero()) {
+                camera_loc = GetFireOrigin(self);
+            }
 
-            // Target selection logic
+            // Target selection logic (FOV based only, matching 08ceabd)
             if (!Target || !ISVALID(Target))
             {
                 DebugPrint("[Aim-Detail] Searching for new target...");
@@ -264,31 +269,8 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                         float fov_dist = screen_center.GetDistanceTo(player_screen_pos);
                         if (fov_dist < best_fov)
                         {
-                            // Implementation of LOS from 08ceabdc130d795a89b92e74b27ed8980e7bc007
-                            TArray<FHitResult> LineOfSightHits;
-                            TArray<AActor*> ActorsToIgnore;
-                            ActorsToIgnore.Add(self);
-
-                            bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                                GetWorld(), fire_origin, player->K2_GetActorLocation(), ETraceTypeQuery::TraceTypeQuery1, false,
-                                ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
-                                { 0,0,0,0 }, { 0,0,0,0 }, 0.f
-                            );
-
-                            bool bIsVisible = !bLineOfSightHit;
-                            if (bLineOfSightHit) {
-                                for (const FHitResult& los_hit : LineOfSightHits) {
-                                    if (los_hit.bBlockingHit && los_hit.Component.Get() && los_hit.Component.Get()->GetOwner() == player) {
-                                        bIsVisible = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (bIsVisible) {
-                                best_fov = fov_dist;
-                                Target = player;
-                            }
+                            best_fov = fov_dist;
+                            Target = player;
                         }
                     }
                 }
@@ -301,20 +283,21 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
             if (Target)
             {
+                FVector fire_origin = GetFireOrigin(self);
                 FVector best_bone_loc = { 0.f, 0.f, 0.f };
                 bool locked_bone_still_valid = false;
 
+                // Validate existing bone lock using LineTraceMulti from Camera
                 if (!LockedBoneName.IsNone())
                 {
                     FVector bone_world_loc = Target->VisualMesh->GetSocketLocation(LockedBoneName);
                     
-                    // Implementation of LOS from 08ceabdc130d795a89b92e74b27ed8980e7bc007
                     TArray<FHitResult> LineOfSightHits;
                     TArray<AActor*> ActorsToIgnore;
                     ActorsToIgnore.Add(self);
 
                     bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                        GetWorld(), fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
+                        GetWorld(), camera_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
                         ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
                         { 0,0,0,0 }, { 0,0,0,0 }, 0.f
                     );
@@ -322,9 +305,15 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                     bool bIsVisible = !bLineOfSightHit;
                     if (bLineOfSightHit) {
                         for (const FHitResult& los_hit : LineOfSightHits) {
-                            if (los_hit.bBlockingHit && los_hit.Component.Get() && los_hit.Component.Get()->GetOwner() == Target) {
-                                bIsVisible = true;
-                                break;
+                            if (los_hit.bBlockingHit) {
+                                if (los_hit.Component.Get() && los_hit.Component.Get()->GetOwner() == Target) {
+                                    bIsVisible = true;
+                                }
+                                else {
+                                    // Optionally log what's blocking the view
+                                    // DebugPrint("[Aim-Detail] Bone %s BLOCKED by %s", LockedBoneName.ToString().c_str(), los_hit.Component.Get() ? los_hit.Component.Get()->GetName().c_str() : "unknown");
+                                }
+                                break; 
                             }
                         }
                     }
@@ -339,6 +328,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                     }
                 }
 
+                // If no valid bone, iterate armor parts to find a visible/penetrable one
                 if (!locked_bone_still_valid)
                 {
                     auto armorMeshList = Target->ArmorPartsMeshList;
@@ -377,13 +367,12 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                             fallback_bone_loc = bone_world_loc;
                                         }
 
-                                        // Implementation of LOS from 08ceabdc130d795a89b92e74b27ed8980e7bc007
                                         TArray<FHitResult> LineOfSightHits;
                                         TArray<AActor*> ActorsToIgnore;
                                         ActorsToIgnore.Add(self);
 
                                         bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
-                                            GetWorld(), fire_origin, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
+                                            GetWorld(), camera_loc, bone_world_loc, ETraceTypeQuery::TraceTypeQuery1, false,
                                             ActorsToIgnore, EDrawDebugTrace::None, &LineOfSightHits, true,
                                             { 0,0,0,0 }, { 0,0,0,0 }, 0.f
                                         );
@@ -391,8 +380,10 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                                         bool bIsVisible = !bLineOfSightHit;
                                         if (bLineOfSightHit) {
                                             for (const FHitResult& los_hit : LineOfSightHits) {
-                                                if (los_hit.bBlockingHit && los_hit.Component.Get() && los_hit.Component.Get()->GetOwner() == Target) {
-                                                    bIsVisible = true;
+                                                if (los_hit.bBlockingHit) {
+                                                    if (los_hit.Component.Get() && los_hit.Component.Get()->GetOwner() == Target) {
+                                                        bIsVisible = true;
+                                                    }
                                                     break;
                                                 }
                                             }
@@ -467,9 +458,9 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                             DebugPrint("[Aim-Detail] Locked regular bone: %s", LockedBoneName.ToString().c_str());
                         }
                         else if (!fallback_bone_name.IsNone()) {
-                            best_bone_loc = fallback_bone_loc;
-                            LockedBoneName = fallback_bone_name;
-                            DebugPrint("[Aim-Detail] FALLBACK LOCK: %s", LockedBoneName.ToString().c_str());
+                            // FALLBACK: If no bone is visible or penetrable, we keep the target but don't aim.
+                            // This prevents the search loop from spamming "Searching...".
+                            // If you want it to lock ANYWAY, set best_bone_loc = fallback_bone_loc here.
                         }
                     }
                 }
@@ -505,11 +496,6 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                             self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
                         }
                     }
-                }
-                else
-                {
-                    Target = nullptr;
-                    LockedBoneName = FName();
                 }
             }
         }
