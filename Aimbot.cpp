@@ -361,38 +361,20 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
         }
     }
 }
-SDK::FVector Predict(SDK::FVector pos, SDK::FVector Velocity, float Distance, float BulletSpeed, float gravity_speed)
+// Tyr's projectile model is hitscan-with-travel-time: no gravity / drop.
+// We only need to lead the target by velocity * (distance / bullet_speed).
+SDK::FVector Predict(SDK::FVector pos, SDK::FVector Velocity, float Distance, float BulletSpeed, float /*gravity_unused*/)
 {
-    // Calculate the time it takes for the bullet to reach the target
-    float Time = Distance / BulletSpeed;
-    SDK::FVector PredictedPos = pos + (Velocity * Time);
-    float BulletDrop = 0.5f * gravity_speed * (Time * Time);
-
-    if (gravity_speed > 1.0f)
-    {
-        // Apply a more aggressive scaling factor for FlyGravity > 1
-        PredictedPos.Z += BulletDrop * gravity_speed;
-    }
-
-    return PredictedPos;
+    if (BulletSpeed < 0.001f) return pos;
+    const float Time = Distance / BulletSpeed;
+    return pos + (Velocity * Time);
 }
 
-static SDK::FVector PredictMouse4(const SDK::FVector& pos, const SDK::FVector& velocity, float distance, float bulletSpeed, float gravityZ)
+static SDK::FVector PredictMouse4(const SDK::FVector& pos, const SDK::FVector& velocity, float distance, float bulletSpeed, float /*gravity_unused*/)
 {
-    float time = 0.0f;
-    if (bulletSpeed > 0.001f)
-    {
-        time = distance / bulletSpeed;
-    }
-
-    SDK::FVector predictedPos = pos + (velocity * time);
-    const float gravityMagnitude = gravityZ < 0.0f ? -gravityZ : gravityZ;
-    if (gravityMagnitude > 0.001f)
-    {
-        predictedPos.Z += 0.5f * gravityMagnitude * time * time;
-    }
-
-    return predictedPos;
+    if (bulletSpeed < 0.001f) return pos;
+    const float time = distance / bulletSpeed;
+    return pos + (velocity * time);
 }
 
 static std::wstring ToWide(const std::string& value)
@@ -709,33 +691,24 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
                 if (!best_bone_loc.IsZero())
                 {
-                    auto worldsettings = SDK::UWorld::GetWorld()->K2_GetWorldSettings();
-                    float WorldGravityZ = worldsettings->GlobalGravityZ;
+                    // Tanks are not ACharacters — use AActor::GetVelocity which works for
+                    // any actor (vehicle, hover, etc.) and reads the live world velocity.
+                    SDK::FVector LastUpdateVelocity = Target->GetVelocity();
 
-                    SDK::ACharacter* ACharacter = (SDK::ACharacter*)(Target);
-
-                    if (ACharacter && ACharacter->CharacterMovement)
+                    auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
+                    if (ps && ps->VehicleStatsAttribute)
                     {
-                        SDK::FVector LastUpdateVelocity = ACharacter->CharacterMovement->LastUpdateVelocity;
+                        float b_speed = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
 
-                        auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
-                        if (ps && ps->VehicleStatsAttribute)
-                        {
-                            float b_speed = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+                        // Lead-only prediction (no gravity in Tyr's projectile model).
+                        float distance = (float)fire_origin.GetDistanceTo(best_bone_loc);
+                        SDK::FVector predicted_loc = Predict(best_bone_loc, LastUpdateVelocity, distance, b_speed, 0.0f);
+                        SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
 
-                            // Horizontal range for ballistic time-of-flight; aiming origin is the
-                            // suspension-adjusted muzzle so the gun, not the camera, points at target.
-                            float distance = HorizontalDistance(fire_origin, best_bone_loc);
-                            SDK::FVector predicted_loc = Predict(best_bone_loc, LastUpdateVelocity, distance, b_speed, WorldGravityZ);
-                            SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
+                        player_controller->SetControlRotation(target_rotation);
 
-                            player_controller->SetControlRotation(target_rotation);
-
-                            // Let the turret resolve pitch/yaw against current hull tilt rather than
-                            // jamming a world rotation into the hull-relative TargetTurretRotation slot.
-                            if (self->TurretComponent) {
-                                self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
-                            }
+                        if (self->TurretComponent) {
+                            self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
                         }
                     }
                 }
@@ -1124,7 +1097,8 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
     }
 
     const SDK::FVector CameraLoc = player_controller->PlayerCameraManager->GetCameraLocation();
-    const float distance = HorizontalDistance(fire_origin, best_bone_loc);
+    // Slant range — Tyr has no gravity, so bullet flies a straight line.
+    const float distance = (float)fire_origin.GetDistanceTo(best_bone_loc);
     const SDK::FRotator current_control_rotation = player_controller->GetControlRotation();
 
     auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
@@ -1181,7 +1155,7 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
         float b_speed = stats->ShellVelocity.CurrentValue;
 
-        SDK::FVector predicted_loc = PredictMouse4(best_bone_loc, TargetVelocity, distance, b_speed, WorldGravityZ);
+        SDK::FVector predicted_loc = PredictMouse4(best_bone_loc, TargetVelocity, distance, b_speed, 0.0f);
         SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
 
         if (PreSubtractHullTilt && self->TurretComponent)
@@ -1313,9 +1287,11 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                     const SDK::FVector muz_msg = self->TurretComponent->LastGunLimitUpdateMessage.MuzzleTransform_41_421659BD45184E3D5766978443FD4064.Translation;
                     draw(std::wstring(L"MuzMsg:   ") + FormatVectorWide(muz_msg), diag_color);
                 }
+                const double tof = (b_speed > 0.001f) ? (double)distance / (double)b_speed : 0.0;
                 draw(std::wstring(L"Ballistic: bSpd=") + FormatDoubleWide(b_speed, 0) +
-                    L"  dropZ=" + FormatSignedDoubleWide(drop_z, 1) +
-                    L"  horizDist=" + FormatDoubleWide(distance, 0), diag_color);
+                    L"  ToF=" + FormatDoubleWide(tof, 3) +
+                    L"  slantDist=" + FormatDoubleWide(distance, 0) +
+                    L"  leadZ=" + FormatSignedDoubleWide(drop_z, 1), diag_color);
                 // Real slope angle from filtered suspension normal — this is the
                 // actual hull tilt (HullTiltPitchAdjustment is not).
                 double slope_deg = 0.0;
