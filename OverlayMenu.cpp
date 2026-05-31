@@ -295,12 +295,18 @@ namespace
                 DrawFeatureCheckbox("Tank boxes", EmpireFeatures::EspBoxes);
                 DrawFeatureCheckbox("Tank labels / distance", EmpireFeatures::EspLabels);
                 DrawFeatureCheckbox("Always-on armor coloration", EmpireFeatures::ArmorVisualization);
+                DrawFeatureCheckbox("Vegetation fade / cull optimization", EmpireFeatures::VegetationOptimization);
+                DrawFeatureCheckbox("Fog / cloud / smoke mitigation", EmpireFeatures::AtmosphereEffectMitigation);
+                DrawFeatureCheckbox("Tracked tank camouflage mitigation", EmpireFeatures::CamouflageMitigation);
 
                 ImGui::Spacing();
                 DrawSectionHeader("Overlay status");
                 DrawSectionStatusLine("Boxes", EmpireFeatures::Get(EmpireFeatures::EspBoxes));
                 DrawSectionStatusLine("Labels", EmpireFeatures::Get(EmpireFeatures::EspLabels));
                 DrawSectionStatusLine("Armor colors", EmpireFeatures::Get(EmpireFeatures::ArmorVisualization));
+                DrawSectionStatusLine("Vegetation optimization", EmpireFeatures::Get(EmpireFeatures::VegetationOptimization));
+                DrawSectionStatusLine("Atmosphere FX mitigation", EmpireFeatures::Get(EmpireFeatures::AtmosphereEffectMitigation));
+                DrawSectionStatusLine("Camouflage mitigation", EmpireFeatures::Get(EmpireFeatures::CamouflageMitigation));
             }
             ImGui::EndChild();
 

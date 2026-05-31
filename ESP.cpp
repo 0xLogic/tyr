@@ -6,19 +6,14 @@
 #include "SDK/WBP_HUD_SniperMode_classes.hpp"
 
 #include <Windows.h>
-#include <iostream>
-#include <chrono>
-#include <thread>
-#include <stdarg.h>
-#include <stdio.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
-#include <fstream>
 
 using namespace SDK;
 
@@ -31,6 +26,59 @@ extern FName GunSocketName;
 
 namespace
 {
+    struct TrackedObjectKey
+    {
+        int32 ObjectIndex = 0;
+        uintptr_t ObjectAddress = 0;
+        uintptr_t ObjectClassAddress = 0;
+        uintptr_t ObjectOuterAddress = 0;
+        SDK::FName ObjectName{};
+
+        bool operator==(const TrackedObjectKey& Other) const
+        {
+            return ObjectIndex == Other.ObjectIndex &&
+                   ObjectAddress == Other.ObjectAddress &&
+                   ObjectClassAddress == Other.ObjectClassAddress &&
+                   ObjectOuterAddress == Other.ObjectOuterAddress &&
+                   ObjectName == Other.ObjectName;
+        }
+
+        bool operator<(const TrackedObjectKey& Other) const
+        {
+            if (ObjectIndex != Other.ObjectIndex)
+            {
+                return ObjectIndex < Other.ObjectIndex;
+            }
+
+            if (ObjectAddress != Other.ObjectAddress)
+            {
+                return ObjectAddress < Other.ObjectAddress;
+            }
+
+            if (ObjectClassAddress != Other.ObjectClassAddress)
+            {
+                return ObjectClassAddress < Other.ObjectClassAddress;
+            }
+
+            if (ObjectOuterAddress != Other.ObjectOuterAddress)
+            {
+                return ObjectOuterAddress < Other.ObjectOuterAddress;
+            }
+
+            if (ObjectName.ComparisonIndex != Other.ObjectName.ComparisonIndex)
+            {
+                return ObjectName.ComparisonIndex < Other.ObjectName.ComparisonIndex;
+            }
+
+            if (ObjectName.Number != Other.ObjectName.Number)
+            {
+                return ObjectName.Number < Other.ObjectName.Number;
+            }
+
+            return false;
+        }
+    };
+
     struct LastSeenEntityInfo
     {
         SDK::FVector LastRootWorld{};
@@ -114,21 +162,25 @@ namespace
     struct ArmorVisualizationSetupState
     {
         SDK::ABP_BaseTank_C* Tank = nullptr;
+        TrackedObjectKey TankKey{};
         ULONGLONG LastAttemptTick = 0;
+        ULONGLONG LastVisualizerRefreshTick = 0;
+        bool IsVisualizationEnabled = false;
+        bool LastRefreshWasForced = false;
     };
 
     struct TurretModState
     {
-        SDK::UBPC_TurretBaseComponent_C* Turret = nullptr;
+        TrackedObjectKey TurretKey{};
         double OriginalMaxTurretRotation = 0.0;
         double OriginalRotationSensitivity = 0.0;
         bool HasSnapshot = false;
-        bool WasAppliedLastFrame = false;
+        bool IsApplied = false;
     };
 
     struct WeaponModState
     {
-        SDK::UBPC_ShellFiringComponent_C* ShellComponent = nullptr;
+        TrackedObjectKey ShellComponentKey{};
         double OriginalRecoilTorque = 0.0;
         double OriginalBaseGunRecoilTorque = 0.0;
         float OriginalGunRecoilAlpha = 0.0f;
@@ -137,7 +189,7 @@ namespace
         double OriginalPreciseDispersionDegrees = 0.0;
         bool OriginalIsPreciseDispersion = false;
         bool HasSnapshot = false;
-        bool WasAppliedLastFrame = false;
+        bool IsApplied = false;
     };
 
     struct TrackedEntityPenetrationInfo
@@ -146,6 +198,247 @@ namespace
         SDK::FLinearColor DisplayColor{ 1.0f, 0.0f, 0.0f, 1.0f };
         ULONGLONG LastRefreshTick = 0;
         bool HasData = false;
+    };
+
+    struct TeamCaptureVictoryEstimate
+    {
+        int32 TeamId = 0;
+        int32 EnemyPointOwnerTeamId = 0;
+        int32 TanksOnEnemyPoint = 0;
+        int32 DefendersOnEnemyPoint = 0;
+        int32 CaptureProgress = 0;
+        int32 CaptureMaxTotal = 0;
+        int32 CapturePointsPerSecond = 0;
+        int32 CaptureUnitCap = 0;
+        double EstimatedSecondsUntilVictory = 0.0;
+        bool HasZone = false;
+        bool HasAttackers = false;
+        bool IsContested = false;
+        bool HasPositiveCaptureRate = false;
+    };
+
+    struct TrackedEntityReloadInfo
+    {
+        double RemainingReloadTime = 0.0;
+        double TotalReloadTime = 0.0;
+        double LastFireTime = 0.0;
+        ULONGLONG LastRefreshTick = 0;
+        bool IsLikelyReloading = false;
+        bool HasData = false;
+    };
+
+    struct TrackedEntityReloadDisplay
+    {
+        std::wstring Text{};
+        SDK::FLinearColor Color{ 1.0f, 1.0f, 1.0f, 1.0f };
+        bool HasDisplay = false;
+    };
+
+    struct VegetationInstancedCullSnapshot
+    {
+        int32 OriginalStartCullDistance = 0;
+        int32 OriginalEndCullDistance = 0;
+        bool HasSnapshot = false;
+        bool IsOptimized = false;
+    };
+
+    struct VegetationPrimitiveCullSnapshot
+    {
+        float OriginalMinDrawDistance = 0.0f;
+        float OriginalLDMaxDrawDistance = 0.0f;
+        float OriginalCachedMaxDrawDistance = 0.0f;
+        float OriginalBoundsScale = 1.0f;
+        bool OriginalAllowCullDistanceVolume = true;
+        bool OriginalNeverDistanceCull = false;
+        bool HasSnapshot = false;
+        bool IsOptimized = false;
+    };
+
+    struct VegetationMaterialSlotSnapshot
+    {
+        SDK::UMaterialInterface* OriginalMaterial = nullptr;
+        std::array<float, 10> OriginalScalarValues{};
+        bool OriginalMaterialWasDynamic = false;
+        bool HasScalarSnapshot = false;
+    };
+
+    struct VegetationPrimitiveAlphaSnapshot
+    {
+        std::vector<float> OriginalCustomPrimitiveData{};
+        std::vector<int32> TouchedCustomPrimitiveIndices{};
+        std::vector<VegetationMaterialSlotSnapshot> MaterialSlots{};
+        bool HasSnapshot = false;
+        bool IsApplied = false;
+    };
+
+    struct VisionBlockerNativeStateSnapshot
+    {
+        float OriginalCamoPercentageIncreaseAmount = 0.0f;
+        std::array<float, 10> OriginalBushMaterialScalarValues{};
+        bool HasFoliageVisionSnapshot = false;
+        bool HasBushMaterialScalarSnapshot = false;
+        bool HasSnapshot = false;
+        bool IsApplied = false;
+        bool LastKnownSniperState = false;
+    };
+
+    struct RenderPersistenceActorSnapshot
+    {
+        bool OriginalHidden = false;
+        bool HasSnapshot = false;
+        bool IsForcedVisible = false;
+    };
+
+    struct RenderPersistencePrimitiveSnapshot
+    {
+        float OriginalMinDrawDistance = 0.0f;
+        float OriginalLDMaxDrawDistance = 0.0f;
+        float OriginalCachedMaxDrawDistance = 0.0f;
+        float OriginalBoundsScale = 1.0f;
+        bool OriginalAllowCullDistanceVolume = true;
+        bool OriginalNeverDistanceCull = false;
+        bool OriginalVisible = true;
+        bool OriginalRenderInMainPass = true;
+        bool OriginalRenderInDepthPass = true;
+        bool OriginalOwnerNoSee = false;
+        bool OriginalOnlyOwnerSee = false;
+        bool OriginalTreatAsBackgroundForOcclusion = false;
+        bool OriginalUseAsOccluder = true;
+        bool OriginalAllowOcclusionWhenHiddenInGame = false;
+        bool OriginalHiddenInGame = false;
+        bool OriginalVisibleInSceneCaptureOnly = false;
+        bool OriginalHiddenInSceneCapture = false;
+        float OriginalOverlayMaterialMaxDrawDistance = 0.0f;
+        int32 OriginalInstanceStartCullDistance = 0;
+        int32 OriginalInstanceEndCullDistance = 0;
+        bool HasSnapshot = false;
+        bool HasMeshOverlaySnapshot = false;
+        bool HasInstancedCullSnapshot = false;
+        bool IsVisibilityForced = false;
+        bool IsDistanceCullForced = false;
+    };
+
+    struct SoftwareOcclusionComponentSnapshot
+    {
+        bool OriginalUseAsOccluder = true;
+        bool HasSnapshot = false;
+        bool IsDisabled = false;
+    };
+
+    struct ExponentialHeightFogMitigationSnapshot
+    {
+        float OriginalFogDensity = 0.0f;
+        SDK::FExponentialHeightFogData OriginalSecondFogData{};
+        float OriginalStartDistance = 0.0f;
+        bool OriginalEnableVolumetricFog = false;
+        bool OriginalRenderInMainPass = true;
+        bool OriginalVisible = true;
+        bool OriginalHiddenInGame = false;
+        bool OriginalTickEnabled = false;
+        bool OriginalActorHidden = false;
+        bool OriginalActorEnabled = true;
+        bool HasActorHiddenSnapshot = false;
+        bool HasActorEnabledSnapshot = false;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct SkyAtmosphereMitigationSnapshot
+    {
+        float OriginalAerialPerspectiveStartDepth = 0.0f;
+        float OriginalAerialPerspectiveViewDistanceScale = 0.0f;
+        float OriginalHeightFogContribution = 0.0f;
+        float OriginalRayleighScatteringScale = 0.0f;
+        float OriginalMieScatteringScale = 0.0f;
+        bool OriginalRenderInMainPass = true;
+        bool OriginalVisible = true;
+        bool OriginalHiddenInGame = false;
+        bool OriginalTickEnabled = false;
+        bool OriginalActorHidden = false;
+        bool HasActorHiddenSnapshot = false;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct VolumetricCloudMitigationSnapshot
+    {
+        float OriginalTracingMaxDistance = 0.0f;
+        float OriginalTracingStartDistanceFromCamera = 0.0f;
+        float OriginalTracingStartMaxDistance = 0.0f;
+        float OriginalViewSampleCountScale = 0.0f;
+        float OriginalShadowViewSampleCountScale = 0.0f;
+        float OriginalShadowTracingDistance = 0.0f;
+        float OriginalSkyLightCloudBottomOcclusion = 0.0f;
+        bool OriginalUsePerSampleAtmosphericLightTransmittance = false;
+        bool OriginalRenderInMainPass = true;
+        bool OriginalVisibleInRealTimeSkyCaptures = true;
+        bool OriginalVisible = true;
+        bool OriginalHiddenInGame = false;
+        bool OriginalTickEnabled = false;
+        bool OriginalActorHidden = false;
+        bool HasActorHiddenSnapshot = false;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct LocalFogVolumeMitigationSnapshot
+    {
+        float OriginalRadialFogExtinction = 0.0f;
+        float OriginalHeightFogExtinction = 0.0f;
+        bool OriginalVisible = true;
+        bool OriginalHiddenInGame = false;
+        bool OriginalTickEnabled = false;
+        bool OriginalActorHidden = false;
+        bool HasActorHiddenSnapshot = false;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct SkyLightCloudMitigationSnapshot
+    {
+        bool OriginalRealTimeCapture = false;
+        bool OriginalCloudAmbientOcclusion = false;
+        float OriginalCloudAmbientOcclusionStrength = 0.0f;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct DirectionalLightCloudMitigationSnapshot
+    {
+        bool OriginalCastShadowsOnClouds = false;
+        bool OriginalCastShadowsOnAtmosphere = false;
+        bool OriginalCastCloudShadows = false;
+        float OriginalCloudShadowStrength = 0.0f;
+        float OriginalCloudShadowOnAtmosphereStrength = 0.0f;
+        float OriginalCloudShadowOnSurfaceStrength = 0.0f;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct NiagaraEffectMitigationSnapshot
+    {
+        bool OriginalAutoActivate = false;
+        bool OriginalActive = false;
+        bool OriginalTickEnabled = false;
+        bool OriginalVisible = true;
+        bool OriginalHiddenInGame = false;
+        bool OriginalRenderingEnabled = true;
+        bool HasSnapshot = false;
+        bool IsMitigated = false;
+    };
+
+    struct GameplayAttributeValueSnapshot
+    {
+        float OriginalBaseValue = 0.0f;
+        float OriginalCurrentValue = 0.0f;
+        bool HasSnapshot = false;
+        bool IsApplied = false;
+    };
+
+    struct TrackedTankCamouflageVehicleStatsSnapshot
+    {
+        GameplayAttributeValueSnapshot CamoPercentage{};
+        GameplayAttributeValueSnapshot BushSpottingTime{};
     };
 
     struct PenetrationVisualPalette
@@ -159,19 +452,207 @@ namespace
     constexpr int32 kHalfPenetrationTier = 1;
     constexpr int32 kBlockedPenetrationTier = 2;
     constexpr ULONGLONG kThreatIndicatorLifetimeMs = 15000;
+    constexpr float kAtmosphereMitigationFarDistance = 1000000.0f;
 
     static std::map<std::string, LastSeenEntityInfo> g_LastSeenEntityCache;
     static std::map<std::string, EnemyShellFireMarkerInfo> g_EnemyShellFireMarkerCache;
     static std::map<std::string, EnemyProjectileTrailInfo> g_EnemyProjectileTrailCache;
     static std::map<std::string, ArmorVisualizationSetupState> g_ArmorVisualizationSetupCache;
     static std::map<std::string, TrackedEntityPenetrationInfo> g_TrackedEntityPenetrationCache;
+    static std::map<std::string, TrackedEntityReloadInfo> g_TrackedEntityReloadCache;
+    static std::map<TrackedObjectKey, bool> g_VegetationVisionBlockerStateCache;
+    static std::map<TrackedObjectKey, VegetationInstancedCullSnapshot> g_VegetationInstancedCullCache;
+    static std::map<TrackedObjectKey, VegetationPrimitiveCullSnapshot> g_VegetationPrimitiveCullCache;
+    static std::map<TrackedObjectKey, VegetationPrimitiveAlphaSnapshot> g_VegetationPrimitiveAlphaCache;
+    static std::map<TrackedObjectKey, VisionBlockerNativeStateSnapshot> g_VisionBlockerNativeStateCache;
+    static std::map<TrackedObjectKey, RenderPersistenceActorSnapshot> g_RenderPersistenceActorCache;
+    static std::map<TrackedObjectKey, RenderPersistencePrimitiveSnapshot> g_RenderPersistencePrimitiveCache;
+    static std::map<TrackedObjectKey, SoftwareOcclusionComponentSnapshot> g_SoftwareOcclusionComponentCache;
+    static std::map<TrackedObjectKey, ExponentialHeightFogMitigationSnapshot> g_ExponentialHeightFogMitigationCache;
+    static std::map<TrackedObjectKey, SkyAtmosphereMitigationSnapshot> g_SkyAtmosphereMitigationCache;
+    static std::map<TrackedObjectKey, VolumetricCloudMitigationSnapshot> g_VolumetricCloudMitigationCache;
+    static std::map<TrackedObjectKey, LocalFogVolumeMitigationSnapshot> g_LocalFogVolumeMitigationCache;
+    static std::map<TrackedObjectKey, SkyLightCloudMitigationSnapshot> g_SkyLightCloudMitigationCache;
+    static std::map<TrackedObjectKey, DirectionalLightCloudMitigationSnapshot> g_DirectionalLightCloudMitigationCache;
+    static std::map<TrackedObjectKey, NiagaraEffectMitigationSnapshot> g_NiagaraEffectMitigationCache;
+    static std::map<TrackedObjectKey, TrackedTankCamouflageVehicleStatsSnapshot> g_TrackedTankCamouflageVehicleStatsCache;
+    static std::set<TrackedObjectKey> g_CachedVisionBlockerKeySet;
+    static std::set<TrackedObjectKey> g_CachedVegetationInstancedKeySet;
+    static std::set<TrackedObjectKey> g_CachedVegetationPrimitiveKeySet;
+    static std::set<TrackedObjectKey> g_CachedSceneRenderActorKeySet;
+    static std::set<TrackedObjectKey> g_CachedSoftwareOcclusionKeySet;
+    static std::set<TrackedObjectKey> g_CachedExponentialHeightFogKeySet;
+    static std::set<TrackedObjectKey> g_CachedSkyAtmosphereKeySet;
+    static std::set<TrackedObjectKey> g_CachedVolumetricCloudKeySet;
+    static std::set<TrackedObjectKey> g_CachedLocalFogVolumeKeySet;
+    static std::set<TrackedObjectKey> g_CachedSkyLightKeySet;
+    static std::set<TrackedObjectKey> g_CachedDirectionalLightKeySet;
+    static std::set<TrackedObjectKey> g_CachedSmokeNiagaraKeySet;
+    static std::vector<TrackedObjectKey> g_CachedVisionBlockers;
+    static std::vector<TrackedObjectKey> g_CachedVegetationInstancedComponents;
+    static std::vector<TrackedObjectKey> g_CachedVegetationPrimitiveComponents;
+    static std::vector<TrackedObjectKey> g_CachedSceneRenderActors;
+    static std::vector<TrackedObjectKey> g_CachedSoftwareOcclusionComponents;
+    static std::vector<TrackedObjectKey> g_CachedExponentialHeightFogComponents;
+    static std::vector<TrackedObjectKey> g_CachedSkyAtmosphereComponents;
+    static std::vector<TrackedObjectKey> g_CachedVolumetricCloudComponents;
+    static std::vector<TrackedObjectKey> g_CachedLocalFogVolumeComponents;
+    static std::vector<TrackedObjectKey> g_CachedSkyLightComponents;
+    static std::vector<TrackedObjectKey> g_CachedDirectionalLightComponents;
+    static std::vector<TrackedObjectKey> g_CachedSmokeNiagaraComponents;
     static TurretModState g_TurretModState;
     static WeaponModState g_WeaponModState;
+    static bool g_VegetationOptimizationHasAppliedState = false;
+    static bool g_AtmosphereEffectMitigationHasAppliedState = false;
+    static bool g_TrackedTankCamouflageHasAppliedState = false;
+    static SDK::UWorld* g_LastTrackedTankCamouflageWorld = nullptr;
+    static bool g_LastTrackedTankCamouflageEnabled = false;
+    static SDK::UWorld* g_LastLocalVehicleModWorld = nullptr;
 
     template <typename T>
     static bool IsUsableObject(T* Object)
     {
         return Object && ISVALID(Object);
+    }
+
+    template <typename T>
+    static TrackedObjectKey MakeTrackedObjectKey(T* Object)
+    {
+        auto* const BaseObject = static_cast<SDK::UObject*>(Object);
+        if (!IsUsableObject(BaseObject) ||
+            BaseObject->Index <= 0 ||
+            !BaseObject->Class ||
+            BaseObject->Name.IsNone())
+        {
+            return {};
+        }
+
+        const SDK::EObjectFlags destructionFlags =
+            SDK::EObjectFlags::BeginDestroyed |
+            SDK::EObjectFlags::FinishDestroyed |
+            SDK::EObjectFlags::TagGarbageTemp |
+            SDK::EObjectFlags::MirroredGarbage;
+        if (BaseObject->Flags & destructionFlags)
+        {
+            return {};
+        }
+
+        if (BaseObject->IsA(SDK::AActor::StaticClass()) &&
+            static_cast<SDK::AActor*>(BaseObject)->IsActorBeingDestroyed())
+        {
+            return {};
+        }
+
+        return TrackedObjectKey{
+            BaseObject->Index,
+            reinterpret_cast<uintptr_t>(BaseObject),
+            reinterpret_cast<uintptr_t>(BaseObject->Class),
+            reinterpret_cast<uintptr_t>(BaseObject->Outer),
+            BaseObject->Name };
+    }
+
+    static bool IsTrackedObjectKeyValid(const TrackedObjectKey& Key)
+    {
+        return Key.ObjectIndex > 0 &&
+               Key.ObjectAddress != 0 &&
+               Key.ObjectClassAddress != 0 &&
+               !Key.ObjectName.IsNone();
+    }
+
+    template <typename T>
+    static T* ResolveTrackedObject(const TrackedObjectKey& Key)
+    {
+        if (!IsTrackedObjectKeyValid(Key))
+        {
+            return nullptr;
+        }
+
+        auto* const BaseObject = SDK::UObject::GObjects->GetByIndex(Key.ObjectIndex);
+        if (!IsUsableObject(BaseObject) ||
+            BaseObject->Index != Key.ObjectIndex ||
+            reinterpret_cast<uintptr_t>(BaseObject) != Key.ObjectAddress ||
+            reinterpret_cast<uintptr_t>(BaseObject->Class) != Key.ObjectClassAddress ||
+            reinterpret_cast<uintptr_t>(BaseObject->Outer) != Key.ObjectOuterAddress ||
+            BaseObject->Name != Key.ObjectName)
+        {
+            return nullptr;
+        }
+
+        const SDK::EObjectFlags destructionFlags =
+            SDK::EObjectFlags::BeginDestroyed |
+            SDK::EObjectFlags::FinishDestroyed |
+            SDK::EObjectFlags::TagGarbageTemp |
+            SDK::EObjectFlags::MirroredGarbage;
+        if (BaseObject->Flags & destructionFlags)
+        {
+            return nullptr;
+        }
+
+        if (BaseObject->IsA(SDK::AActor::StaticClass()) &&
+            static_cast<SDK::AActor*>(BaseObject)->IsActorBeingDestroyed())
+        {
+            return nullptr;
+        }
+
+        if (!BaseObject->IsA(T::StaticClass()))
+        {
+            return nullptr;
+        }
+
+        return static_cast<T*>(BaseObject);
+    }
+
+    template <typename T>
+    static void CacheTrackedObject(
+        T* Object,
+        std::set<TrackedObjectKey>* KeySet,
+        std::vector<TrackedObjectKey>* OutObjects)
+    {
+        if (!IsUsableObject(Object) || !KeySet || !OutObjects)
+        {
+            return;
+        }
+
+        const TrackedObjectKey objectKey = MakeTrackedObjectKey(Object);
+        if (!IsTrackedObjectKeyValid(objectKey))
+        {
+            return;
+        }
+
+        if (KeySet->insert(objectKey).second)
+        {
+            OutObjects->push_back(objectKey);
+        }
+    }
+
+    template <typename T, typename Callback>
+    static void ForEachResolvedTrackedObject(
+        std::vector<TrackedObjectKey>* ObjectKeys,
+        std::set<TrackedObjectKey>* KeySet,
+        Callback CallbackFn)
+    {
+        if (!ObjectKeys)
+        {
+            return;
+        }
+
+        for (auto it = ObjectKeys->begin(); it != ObjectKeys->end();)
+        {
+            const TrackedObjectKey objectKey = *it;
+            if (auto* const Object = ResolveTrackedObject<T>(objectKey))
+            {
+                CallbackFn(Object);
+                ++it;
+                continue;
+            }
+
+            if (KeySet)
+            {
+                KeySet->erase(objectKey);
+            }
+
+            it = ObjectKeys->erase(it);
+        }
     }
 
     static bool IsUsableTank(SDK::ABP_BaseTank_C* Tank)
@@ -204,7 +685,2755 @@ namespace
         return SDK::FLinearColor{ 1.f, 1.f, 1.f, 1.f };
     }
 
+    static float GetMinimumSceneRenderDistanceCm()
+    {
+        return 0.0f;
+    }
+
+    static bool IsBeyondSceneDrawDistance(const SDK::FVector& ReferenceWorld, const SDK::FVector& TargetWorld)
+    {
+        if (ReferenceWorld.IsZero() || TargetWorld.IsZero())
+        {
+            return false;
+        }
+
+        const float minimumSceneRenderDistanceCm = GetMinimumSceneRenderDistanceCm();
+        if (minimumSceneRenderDistanceCm <= 0.0f)
+        {
+            return false;
+        }
+
+        return ReferenceWorld.GetDistanceTo(TargetWorld) > static_cast<double>(minimumSceneRenderDistanceCm);
+    }
+
+    static SDK::FName MakeNameFromWide(const wchar_t* Value)
+    {
+        if (!Value)
+        {
+            return SDK::FName{};
+        }
+
+        return SDK::UKismetStringLibrary::Conv_StringToName(SDK::FString(Value));
+    }
+
+    static void CollectWorldLevels(
+        SDK::UWorld* World,
+        std::vector<SDK::ULevel*>* OutLevels)
+    {
+        if (!OutLevels)
+        {
+            return;
+        }
+
+        OutLevels->clear();
+        if (!World)
+        {
+            return;
+        }
+
+        auto addLevel = [&](SDK::ULevel* Level)
+        {
+            if (!Level || !ISVALID(Level))
+            {
+                return;
+            }
+
+            for (SDK::ULevel* existingLevel : *OutLevels)
+            {
+                if (existingLevel == Level)
+                {
+                    return;
+                }
+            }
+
+            OutLevels->push_back(Level);
+        };
+
+        addLevel(World->PersistentLevel);
+        for (SDK::ULevel* Level : World->Levels)
+        {
+            addLevel(Level);
+        }
+    }
+
+    static bool AreGameplayAttributeValuesNear(
+        const SDK::FGameplayAttributeData& Attribute,
+        float DesiredValue)
+    {
+        return std::fabs(Attribute.BaseValue - DesiredValue) <= 0.001f &&
+               std::fabs(Attribute.CurrentValue - DesiredValue) <= 0.001f;
+    }
+
+    static void CaptureGameplayAttributeValueSnapshot(
+        const SDK::FGameplayAttributeData& Attribute,
+        GameplayAttributeValueSnapshot* Snapshot)
+    {
+        if (!Snapshot || Snapshot->HasSnapshot)
+        {
+            return;
+        }
+
+        Snapshot->OriginalBaseValue = Attribute.BaseValue;
+        Snapshot->OriginalCurrentValue = Attribute.CurrentValue;
+        Snapshot->HasSnapshot = true;
+    }
+
+    static bool ApplyGameplayAttributeValueOverride(
+        SDK::FGameplayAttributeData* Attribute,
+        GameplayAttributeValueSnapshot* Snapshot,
+        float DesiredValue)
+    {
+        if (!Attribute || !Snapshot)
+        {
+            return false;
+        }
+
+        CaptureGameplayAttributeValueSnapshot(*Attribute, Snapshot);
+        const bool valueDriftedFromDesired = !AreGameplayAttributeValuesNear(*Attribute, DesiredValue);
+        if (Snapshot->HasSnapshot && Snapshot->IsApplied && valueDriftedFromDesired)
+        {
+            Snapshot->OriginalBaseValue = Attribute->BaseValue;
+            Snapshot->OriginalCurrentValue = Attribute->CurrentValue;
+        }
+
+        const bool needsWrite =
+            !Snapshot->IsApplied ||
+            valueDriftedFromDesired;
+        if (!needsWrite)
+        {
+            Snapshot->IsApplied = true;
+            return false;
+        }
+
+        Attribute->BaseValue = DesiredValue;
+        Attribute->CurrentValue = DesiredValue;
+        Snapshot->IsApplied = true;
+        return true;
+    }
+
+    static bool RestoreGameplayAttributeValueSnapshot(
+        SDK::FGameplayAttributeData* Attribute,
+        GameplayAttributeValueSnapshot* Snapshot)
+    {
+        if (!Attribute || !Snapshot || !Snapshot->HasSnapshot)
+        {
+            if (Snapshot)
+            {
+                Snapshot->IsApplied = false;
+            }
+            return false;
+        }
+
+        const bool needsWrite =
+            std::fabs(Attribute->BaseValue - Snapshot->OriginalBaseValue) > 0.001f ||
+            std::fabs(Attribute->CurrentValue - Snapshot->OriginalCurrentValue) > 0.001f;
+        if (needsWrite)
+        {
+            Attribute->BaseValue = Snapshot->OriginalBaseValue;
+            Attribute->CurrentValue = Snapshot->OriginalCurrentValue;
+        }
+
+        Snapshot->IsApplied = false;
+        return needsWrite;
+    }
+
+    static void ApplyTrackedTankCamouflageVehicleStats(
+        SDK::UTyrAttributeSetVehicleStats* VehicleStats)
+    {
+        if (!IsUsableObject(VehicleStats))
+        {
+            return;
+        }
+
+        const TrackedObjectKey statsKey = MakeTrackedObjectKey(VehicleStats);
+        if (!IsTrackedObjectKeyValid(statsKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_TrackedTankCamouflageVehicleStatsCache[statsKey];
+        const SDK::FGameplayAttributeData previousCamoPercentage = VehicleStats->CamoPercentage;
+        const SDK::FGameplayAttributeData previousBushSpottingTime = VehicleStats->BushSpottingTime;
+        const bool camoChanged = ApplyGameplayAttributeValueOverride(
+            &VehicleStats->CamoPercentage,
+            &snapshot.CamoPercentage,
+            0.0f);
+        const bool bushChanged = ApplyGameplayAttributeValueOverride(
+            &VehicleStats->BushSpottingTime,
+            &snapshot.BushSpottingTime,
+            0.0f);
+
+        if (camoChanged)
+        {
+            VehicleStats->OnRep_CamoPercentage(previousCamoPercentage);
+        }
+
+        if (bushChanged)
+        {
+            VehicleStats->OnRep_BushSpottingTime(previousBushSpottingTime);
+        }
+
+        if (snapshot.CamoPercentage.IsApplied || snapshot.BushSpottingTime.IsApplied)
+        {
+            g_TrackedTankCamouflageHasAppliedState = true;
+        }
+    }
+
+    static void RestoreTrackedTankCamouflageVehicleStats(
+        SDK::UTyrAttributeSetVehicleStats* VehicleStats)
+    {
+        if (!IsUsableObject(VehicleStats))
+        {
+            return;
+        }
+
+        const TrackedObjectKey statsKey = MakeTrackedObjectKey(VehicleStats);
+        const auto cacheIt = g_TrackedTankCamouflageVehicleStatsCache.find(statsKey);
+        if (cacheIt == g_TrackedTankCamouflageVehicleStatsCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = cacheIt->second;
+        const SDK::FGameplayAttributeData previousCamoPercentage = VehicleStats->CamoPercentage;
+        const SDK::FGameplayAttributeData previousBushSpottingTime = VehicleStats->BushSpottingTime;
+        const bool camoChanged = RestoreGameplayAttributeValueSnapshot(
+            &VehicleStats->CamoPercentage,
+            &snapshot.CamoPercentage);
+        const bool bushChanged = RestoreGameplayAttributeValueSnapshot(
+            &VehicleStats->BushSpottingTime,
+            &snapshot.BushSpottingTime);
+
+        if (camoChanged)
+        {
+            VehicleStats->OnRep_CamoPercentage(previousCamoPercentage);
+        }
+
+        if (bushChanged)
+        {
+            VehicleStats->OnRep_BushSpottingTime(previousBushSpottingTime);
+        }
+    }
+
+    static void RestoreAllTrackedTankCamouflageMitigationState()
+    {
+        for (auto& vehicleStatsEntry : g_TrackedTankCamouflageVehicleStatsCache)
+        {
+            if (auto* const vehicleStats =
+                    ResolveTrackedObject<SDK::UTyrAttributeSetVehicleStats>(vehicleStatsEntry.first))
+            {
+                RestoreTrackedTankCamouflageVehicleStats(vehicleStats);
+            }
+        }
+
+        g_TrackedTankCamouflageVehicleStatsCache.clear();
+        g_TrackedTankCamouflageHasAppliedState = false;
+    }
+
+    static void ResetTrackedTankCamouflageMitigationLifecycle()
+    {
+        g_LastTrackedTankCamouflageWorld = nullptr;
+        g_LastTrackedTankCamouflageEnabled = false;
+    }
+
+    static void DisableTrackedTankCamouflageMitigationForCurrentContext()
+    {
+        if (g_TrackedTankCamouflageHasAppliedState)
+        {
+            RestoreAllTrackedTankCamouflageMitigationState();
+        }
+
+        ResetTrackedTankCamouflageMitigationLifecycle();
+    }
+
+    static void RefreshTrackedTankCamouflageMitigationLifecycle(
+        SDK::UWorld* World,
+        bool bEnableMitigation)
+    {
+        const bool needsRestorePass = !bEnableMitigation && g_TrackedTankCamouflageHasAppliedState;
+        if (!World)
+        {
+            if (g_TrackedTankCamouflageHasAppliedState)
+            {
+                RestoreAllTrackedTankCamouflageMitigationState();
+            }
+
+            ResetTrackedTankCamouflageMitigationLifecycle();
+            return;
+        }
+
+        const bool worldChanged = g_LastTrackedTankCamouflageWorld != World;
+        const bool mitigationToggled = g_LastTrackedTankCamouflageEnabled != bEnableMitigation;
+        if (worldChanged)
+        {
+            RestoreAllTrackedTankCamouflageMitigationState();
+        }
+
+        if (!bEnableMitigation && (needsRestorePass || mitigationToggled || worldChanged))
+        {
+            RestoreAllTrackedTankCamouflageMitigationState();
+        }
+
+        g_LastTrackedTankCamouflageWorld = World;
+        g_LastTrackedTankCamouflageEnabled = bEnableMitigation;
+    }
+
+    static void TrackAndApplyTrackedTankCamouflageMitigation(
+        SDK::ATyrPlayerStateBase* PlayerState,
+        std::set<TrackedObjectKey>* OutVehicleStatsKeys)
+    {
+        if (!OutVehicleStatsKeys || !IsUsableObject(PlayerState))
+        {
+            return;
+        }
+
+        if (auto* const vehicleStats = PlayerState->VehicleStatsAttribute;
+            IsUsableObject(vehicleStats))
+        {
+            const TrackedObjectKey statsKey = MakeTrackedObjectKey(vehicleStats);
+            if (IsTrackedObjectKeyValid(statsKey))
+            {
+                OutVehicleStatsKeys->insert(statsKey);
+                ApplyTrackedTankCamouflageVehicleStats(vehicleStats);
+            }
+        }
+    }
+
+    static void ReconcileTrackedTankCamouflageMitigation(
+        const std::set<TrackedObjectKey>& ActiveVehicleStatsKeys)
+    {
+        for (auto it = g_TrackedTankCamouflageVehicleStatsCache.begin();
+             it != g_TrackedTankCamouflageVehicleStatsCache.end();)
+        {
+            if (ActiveVehicleStatsKeys.find(it->first) != ActiveVehicleStatsKeys.end())
+            {
+                ++it;
+                continue;
+            }
+
+            if (auto* const vehicleStats = ResolveTrackedObject<SDK::UTyrAttributeSetVehicleStats>(it->first))
+            {
+                RestoreTrackedTankCamouflageVehicleStats(vehicleStats);
+            }
+
+            it = g_TrackedTankCamouflageVehicleStatsCache.erase(it);
+        }
+        g_TrackedTankCamouflageHasAppliedState = !g_TrackedTankCamouflageVehicleStatsCache.empty();
+    }
+
+    static bool TryGetActiveProjectileMovementComponent(
+        SDK::ABP_BaseTank_C* Tank,
+        SDK::UProjectileMovementComponent** OutProjectileMovement);
+
+    static bool TryGetCurrentShellBallistics(
+        SDK::UWorld* World,
+        SDK::ABP_BaseTank_C* Tank,
+        SDK::ATyrPlayerStateBase* TankState,
+        float* OutShellSpeed,
+        float* OutGravityZ)
+    {
+        if (!World || !IsUsableTank(Tank) || !OutShellSpeed || !OutGravityZ)
+        {
+            return false;
+        }
+
+        *OutShellSpeed = Tank->GetShellVelocity();
+        if (*OutShellSpeed <= 0.001f &&
+            IsUsableObject(TankState) &&
+            IsUsableObject(TankState->VehicleStatsAttribute))
+        {
+            *OutShellSpeed = TankState->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+            if (*OutShellSpeed <= 0.001f)
+            {
+                *OutShellSpeed = TankState->VehicleStatsAttribute->ShellVelocity.BaseValue;
+            }
+        }
+
+        auto* const worldSettings = World->K2_GetWorldSettings();
+        *OutGravityZ = worldSettings ? worldSettings->GlobalGravityZ : -980.0f;
+
+        SDK::UProjectileMovementComponent* projectileMovement = nullptr;
+        if (TryGetActiveProjectileMovementComponent(Tank, &projectileMovement) && IsUsableObject(projectileMovement))
+        {
+            *OutGravityZ *= projectileMovement->ProjectileGravityScale;
+        }
+
+        return *OutShellSpeed > 0.001f;
+    }
+
+    static SDK::FVector PredictBallisticLeadPoint(
+        const SDK::FVector& FireOrigin,
+        const SDK::FVector& TargetPosition,
+        const SDK::FVector& TargetVelocity,
+        float ShellSpeed,
+        float GravityZ)
+    {
+        if (ShellSpeed <= 0.001f)
+        {
+            return TargetPosition;
+        }
+
+        const float gravityMagnitude = GravityZ < 0.0f ? -GravityZ : GravityZ;
+        float timeToImpact = static_cast<float>(FireOrigin.GetDistanceTo(TargetPosition)) / ShellSpeed;
+        if (timeToImpact < 0.0f)
+        {
+            timeToImpact = 0.0f;
+        }
+
+        SDK::FVector predictedPosition = TargetPosition;
+        for (int32 iteration = 0; iteration < 4; ++iteration)
+        {
+            predictedPosition = TargetPosition + (TargetVelocity * timeToImpact);
+            if (gravityMagnitude > 0.001f)
+            {
+                predictedPosition.Z += 0.5f * gravityMagnitude * timeToImpact * timeToImpact;
+            }
+
+            const float updatedDistance = static_cast<float>(FireOrigin.GetDistanceTo(predictedPosition));
+            if (updatedDistance <= 0.001f)
+            {
+                break;
+            }
+
+            const float updatedTimeToImpact = updatedDistance / ShellSpeed;
+            if (std::fabs(updatedTimeToImpact - timeToImpact) <= 0.001f)
+            {
+                timeToImpact = updatedTimeToImpact;
+                break;
+            }
+
+            timeToImpact = updatedTimeToImpact;
+        }
+
+        return predictedPosition;
+    }
+
+    static void CaptureRenderPersistencePrimitiveSnapshot(
+        SDK::UPrimitiveComponent* Primitive,
+        RenderPersistencePrimitiveSnapshot* Snapshot)
+    {
+        if (!IsUsableObject(Primitive) || !Snapshot || Snapshot->HasSnapshot)
+        {
+            return;
+        }
+
+        Snapshot->OriginalMinDrawDistance = Primitive->MinDrawDistance;
+        Snapshot->OriginalLDMaxDrawDistance = Primitive->LDMaxDrawDistance;
+        Snapshot->OriginalCachedMaxDrawDistance = Primitive->CachedMaxDrawDistance;
+        Snapshot->OriginalBoundsScale = Primitive->BoundsScale;
+        Snapshot->OriginalAllowCullDistanceVolume = Primitive->bAllowCullDistanceVolume;
+        Snapshot->OriginalNeverDistanceCull = Primitive->bNeverDistanceCull;
+        Snapshot->OriginalVisible = Primitive->bVisible;
+        Snapshot->OriginalRenderInMainPass = Primitive->bRenderInMainPass;
+        Snapshot->OriginalRenderInDepthPass = Primitive->bRenderInDepthPass;
+        Snapshot->OriginalOwnerNoSee = Primitive->bOwnerNoSee;
+        Snapshot->OriginalOnlyOwnerSee = Primitive->bOnlyOwnerSee;
+        Snapshot->OriginalTreatAsBackgroundForOcclusion = Primitive->bTreatAsBackgroundForOcclusion;
+        Snapshot->OriginalUseAsOccluder = Primitive->bUseAsOccluder;
+        Snapshot->OriginalAllowOcclusionWhenHiddenInGame = Primitive->bAllowOcclusionWhenHiddenInGame;
+        Snapshot->OriginalHiddenInGame = Primitive->bHiddenInGame;
+        Snapshot->OriginalVisibleInSceneCaptureOnly = Primitive->bVisibleInSceneCaptureOnly;
+        Snapshot->OriginalHiddenInSceneCapture = Primitive->bHiddenInSceneCapture;
+
+        if (Primitive->IsA(SDK::UMeshComponent::StaticClass()))
+        {
+            auto* const MeshComponent = static_cast<SDK::UMeshComponent*>(Primitive);
+            Snapshot->OriginalOverlayMaterialMaxDrawDistance = MeshComponent->GetOverlayMaterialMaxDrawDistance();
+            Snapshot->HasMeshOverlaySnapshot = true;
+        }
+
+        if (Primitive->IsA(SDK::UInstancedStaticMeshComponent::StaticClass()))
+        {
+            auto* const InstancedMeshComponent = static_cast<SDK::UInstancedStaticMeshComponent*>(Primitive);
+            Snapshot->OriginalInstanceStartCullDistance = InstancedMeshComponent->InstanceMinDrawDistance;
+            Snapshot->OriginalInstanceEndCullDistance = InstancedMeshComponent->InstanceEndCullDistance;
+            Snapshot->HasInstancedCullSnapshot = true;
+        }
+
+        Snapshot->HasSnapshot = true;
+    }
+
+    static void ApplyVisibilityPersistenceToActor(SDK::AActor* Actor)
+    {
+        if (!IsUsableObject(Actor))
+        {
+            return;
+        }
+
+        const TrackedObjectKey actorKey = MakeTrackedObjectKey(Actor);
+        if (!IsTrackedObjectKeyValid(actorKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_RenderPersistenceActorCache[actorKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalHidden = Actor->bHidden;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsForcedVisible)
+        {
+            return;
+        }
+
+        Actor->SetActorHiddenInGame(false);
+        snapshot.IsForcedVisible = true;
+    }
+
+    static void ApplyVisibilityPersistenceToPrimitive(SDK::UPrimitiveComponent* Primitive)
+    {
+        if (!IsUsableObject(Primitive))
+        {
+            return;
+        }
+
+        const TrackedObjectKey primitiveKey = MakeTrackedObjectKey(Primitive);
+        if (!IsTrackedObjectKeyValid(primitiveKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_RenderPersistencePrimitiveCache[primitiveKey];
+        CaptureRenderPersistencePrimitiveSnapshot(Primitive, &snapshot);
+        if (snapshot.IsVisibilityForced)
+        {
+            return;
+        }
+
+        Primitive->SetVisibility(true, true);
+        Primitive->SetHiddenInGame(false, true);
+        Primitive->SetRenderInMainPass(true);
+        Primitive->SetRenderInDepthPass(true);
+        Primitive->SetOwnerNoSee(false);
+        Primitive->SetOnlyOwnerSee(false);
+        Primitive->SetAllowOcclusionWhenHiddenInGame(true);
+        Primitive->SetHiddenInSceneCapture(false);
+        Primitive->SetVisibleInSceneCaptureOnly(false);
+        Primitive->bTreatAsBackgroundForOcclusion = false;
+        Primitive->bUseAsOccluder = false;
+        snapshot.IsVisibilityForced = true;
+    }
+
+    static void RestoreRenderPersistenceForPrimitive(SDK::UPrimitiveComponent* Primitive)
+    {
+        if (!IsUsableObject(Primitive))
+        {
+            return;
+        }
+
+        const TrackedObjectKey primitiveKey = MakeTrackedObjectKey(Primitive);
+        const auto snapshotIt = g_RenderPersistencePrimitiveCache.find(primitiveKey);
+        if (snapshotIt == g_RenderPersistencePrimitiveCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        Primitive->MinDrawDistance = snapshot.OriginalMinDrawDistance;
+        Primitive->LDMaxDrawDistance = snapshot.OriginalLDMaxDrawDistance;
+        Primitive->CachedMaxDrawDistance = snapshot.OriginalCachedMaxDrawDistance;
+        Primitive->BoundsScale = snapshot.OriginalBoundsScale;
+        Primitive->bAllowCullDistanceVolume = snapshot.OriginalAllowCullDistanceVolume;
+        Primitive->bNeverDistanceCull = snapshot.OriginalNeverDistanceCull;
+        Primitive->SetCullDistance(snapshot.OriginalLDMaxDrawDistance);
+        Primitive->SetVisibility(snapshot.OriginalVisible, true);
+        Primitive->SetHiddenInGame(snapshot.OriginalHiddenInGame, true);
+        Primitive->SetRenderInMainPass(snapshot.OriginalRenderInMainPass);
+        Primitive->SetRenderInDepthPass(snapshot.OriginalRenderInDepthPass);
+        Primitive->SetOwnerNoSee(snapshot.OriginalOwnerNoSee);
+        Primitive->SetOnlyOwnerSee(snapshot.OriginalOnlyOwnerSee);
+        Primitive->SetAllowOcclusionWhenHiddenInGame(snapshot.OriginalAllowOcclusionWhenHiddenInGame);
+        Primitive->SetHiddenInSceneCapture(snapshot.OriginalHiddenInSceneCapture);
+        Primitive->SetVisibleInSceneCaptureOnly(snapshot.OriginalVisibleInSceneCaptureOnly);
+        Primitive->bTreatAsBackgroundForOcclusion = snapshot.OriginalTreatAsBackgroundForOcclusion;
+        Primitive->bUseAsOccluder = snapshot.OriginalUseAsOccluder;
+
+        if (snapshot.HasMeshOverlaySnapshot && Primitive->IsA(SDK::UMeshComponent::StaticClass()))
+        {
+            auto* const MeshComponent = static_cast<SDK::UMeshComponent*>(Primitive);
+            MeshComponent->SetOverlayMaterialMaxDrawDistance(snapshot.OriginalOverlayMaterialMaxDrawDistance);
+        }
+
+        if (snapshot.HasInstancedCullSnapshot && Primitive->IsA(SDK::UInstancedStaticMeshComponent::StaticClass()))
+        {
+            auto* const InstancedMeshComponent = static_cast<SDK::UInstancedStaticMeshComponent*>(Primitive);
+            InstancedMeshComponent->SetCullDistances(snapshot.OriginalInstanceStartCullDistance, snapshot.OriginalInstanceEndCullDistance);
+        }
+
+        snapshot.IsVisibilityForced = false;
+        snapshot.IsDistanceCullForced = false;
+    }
+
+    static void RestoreRenderPersistenceForActor(SDK::AActor* Actor)
+    {
+        if (!IsUsableObject(Actor))
+        {
+            return;
+        }
+
+        const TrackedObjectKey actorKey = MakeTrackedObjectKey(Actor);
+        const auto snapshotIt = g_RenderPersistenceActorCache.find(actorKey);
+        if (snapshotIt == g_RenderPersistenceActorCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        Actor->SetActorHiddenInGame(snapshot.OriginalHidden);
+        snapshot.IsForcedVisible = false;
+    }
+
+    static void ApplySoftwareOcclusionDisable(SDK::UTyrSoftwareOcclusionComponent* OcclusionComponent)
+    {
+        if (!IsUsableObject(OcclusionComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey occlusionKey = MakeTrackedObjectKey(OcclusionComponent);
+        if (!IsTrackedObjectKeyValid(occlusionKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_SoftwareOcclusionComponentCache[occlusionKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalUseAsOccluder = OcclusionComponent->bUseAsOccluder;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsDisabled)
+        {
+            return;
+        }
+
+        OcclusionComponent->bUseAsOccluder = false;
+        snapshot.IsDisabled = true;
+    }
+
+    static void RestoreSoftwareOcclusionState(SDK::UTyrSoftwareOcclusionComponent* OcclusionComponent)
+    {
+        if (!IsUsableObject(OcclusionComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey occlusionKey = MakeTrackedObjectKey(OcclusionComponent);
+        const auto snapshotIt = g_SoftwareOcclusionComponentCache.find(occlusionKey);
+        if (snapshotIt == g_SoftwareOcclusionComponentCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        OcclusionComponent->bUseAsOccluder = snapshot.OriginalUseAsOccluder;
+        snapshot.IsDisabled = false;
+    }
+
+    static void RestoreAllRenderPersistenceState()
+    {
+        for (auto& actorEntry : g_RenderPersistenceActorCache)
+        {
+            if (auto* const actor = ResolveTrackedObject<SDK::AActor>(actorEntry.first))
+            {
+                RestoreRenderPersistenceForActor(actor);
+            }
+        }
+
+        for (auto& primitiveEntry : g_RenderPersistencePrimitiveCache)
+        {
+            if (auto* const primitive = ResolveTrackedObject<SDK::UPrimitiveComponent>(primitiveEntry.first))
+            {
+                RestoreRenderPersistenceForPrimitive(primitive);
+            }
+        }
+
+        for (auto& occlusionEntry : g_SoftwareOcclusionComponentCache)
+        {
+            if (auto* const occlusionComponent = ResolveTrackedObject<SDK::UTyrSoftwareOcclusionComponent>(occlusionEntry.first))
+            {
+                RestoreSoftwareOcclusionState(occlusionComponent);
+            }
+        }
+
+        g_RenderPersistenceActorCache.clear();
+        g_RenderPersistencePrimitiveCache.clear();
+        g_SoftwareOcclusionComponentCache.clear();
+        g_CachedSceneRenderActorKeySet.clear();
+        g_CachedSceneRenderActors.clear();
+        g_CachedSoftwareOcclusionKeySet.clear();
+        g_CachedSoftwareOcclusionComponents.clear();
+    }
+
+    static void ApplyExponentialHeightFogMitigation(SDK::UExponentialHeightFogComponent* FogComponent)
+    {
+        if (!IsUsableObject(FogComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey fogKey = MakeTrackedObjectKey(FogComponent);
+        if (!IsTrackedObjectKeyValid(fogKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_ExponentialHeightFogMitigationCache[fogKey];
+        auto* const ownerActor = FogComponent->GetOwner();
+        auto* const fogActor =
+            IsUsableObject(ownerActor) && ownerActor->IsA(SDK::AExponentialHeightFog::StaticClass())
+            ? static_cast<SDK::AExponentialHeightFog*>(ownerActor)
+            : nullptr;
+
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalFogDensity = FogComponent->FogDensity;
+            snapshot.OriginalSecondFogData = FogComponent->SecondFogData;
+            snapshot.OriginalStartDistance = FogComponent->StartDistance;
+            snapshot.OriginalEnableVolumetricFog = FogComponent->bEnableVolumetricFog;
+            snapshot.OriginalRenderInMainPass = FogComponent->bRenderInMainPass;
+            snapshot.OriginalVisible = FogComponent->bVisible;
+            snapshot.OriginalHiddenInGame = FogComponent->bHiddenInGame;
+            snapshot.OriginalTickEnabled = FogComponent->IsComponentTickEnabled();
+
+            if (IsUsableObject(fogActor))
+            {
+                snapshot.OriginalActorHidden = fogActor->bHidden;
+                snapshot.OriginalActorEnabled = fogActor->bEnabled;
+                snapshot.HasActorHiddenSnapshot = true;
+                snapshot.HasActorEnabledSnapshot = true;
+            }
+
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        if (IsUsableObject(fogActor))
+        {
+            fogActor->SetActorHiddenInGame(true);
+            fogActor->bEnabled = false;
+            fogActor->OnRep_bEnabled();
+        }
+
+        FogComponent->SetVisibility(false, true);
+        FogComponent->SetHiddenInGame(true, true);
+        FogComponent->SetComponentTickEnabled(false);
+        FogComponent->SetRenderInMainPass(false);
+        FogComponent->SetStartDistance(kAtmosphereMitigationFarDistance);
+        FogComponent->SetFogDensity(0.0f);
+
+        SDK::FExponentialHeightFogData disabledSecondFogData = snapshot.OriginalSecondFogData;
+        disabledSecondFogData.FogDensity = 0.0f;
+        FogComponent->SetSecondFogData(disabledSecondFogData);
+        FogComponent->SetVolumetricFog(false);
+
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+    static void RestoreExponentialHeightFogMitigation(SDK::UExponentialHeightFogComponent* FogComponent)
+    {
+        if (!IsUsableObject(FogComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey fogKey = MakeTrackedObjectKey(FogComponent);
+        const auto snapshotIt = g_ExponentialHeightFogMitigationCache.find(fogKey);
+        if (snapshotIt == g_ExponentialHeightFogMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        auto* const ownerActor = FogComponent->GetOwner();
+        auto* const fogActor =
+            IsUsableObject(ownerActor) && ownerActor->IsA(SDK::AExponentialHeightFog::StaticClass())
+            ? static_cast<SDK::AExponentialHeightFog*>(ownerActor)
+            : nullptr;
+
+        if (IsUsableObject(fogActor) && snapshot.HasActorHiddenSnapshot)
+        {
+            fogActor->SetActorHiddenInGame(snapshot.OriginalActorHidden);
+        }
+
+        if (IsUsableObject(fogActor) && snapshot.HasActorEnabledSnapshot)
+        {
+            fogActor->bEnabled = snapshot.OriginalActorEnabled;
+            fogActor->OnRep_bEnabled();
+        }
+
+        FogComponent->SetVisibility(snapshot.OriginalVisible, true);
+        FogComponent->SetHiddenInGame(snapshot.OriginalHiddenInGame, true);
+        FogComponent->SetComponentTickEnabled(snapshot.OriginalTickEnabled);
+        FogComponent->SetRenderInMainPass(snapshot.OriginalRenderInMainPass);
+        FogComponent->SetStartDistance(snapshot.OriginalStartDistance);
+        FogComponent->SetFogDensity(snapshot.OriginalFogDensity);
+        FogComponent->SetSecondFogData(snapshot.OriginalSecondFogData);
+        FogComponent->SetVolumetricFog(snapshot.OriginalEnableVolumetricFog);
+        snapshot.IsMitigated = false;
+    }
+
+    static void ApplySkyAtmosphereMitigation(SDK::USkyAtmosphereComponent* SkyAtmosphereComponent)
+    {
+        if (!IsUsableObject(SkyAtmosphereComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(SkyAtmosphereComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_SkyAtmosphereMitigationCache[componentKey];
+        auto* const ownerActor = SkyAtmosphereComponent->GetOwner();
+        const bool hideOwnerActor =
+            IsUsableObject(ownerActor) &&
+            (ownerActor->IsA(SDK::ASkyAtmosphere::StaticClass()) ||
+             ownerActor->IsA(SDK::AAtmosphericFog::StaticClass()));
+
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalAerialPerspectiveStartDepth = SkyAtmosphereComponent->AerialPerspectiveStartDepth;
+            snapshot.OriginalAerialPerspectiveViewDistanceScale =
+                SkyAtmosphereComponent->AerialPespectiveViewDistanceScale;
+            snapshot.OriginalHeightFogContribution = SkyAtmosphereComponent->HeightFogContribution;
+            snapshot.OriginalRayleighScatteringScale = SkyAtmosphereComponent->RayleighScatteringScale;
+            snapshot.OriginalMieScatteringScale = SkyAtmosphereComponent->MieScatteringScale;
+            snapshot.OriginalRenderInMainPass = SkyAtmosphereComponent->bRenderInMainPass;
+            snapshot.OriginalVisible = SkyAtmosphereComponent->bVisible;
+            snapshot.OriginalHiddenInGame = SkyAtmosphereComponent->bHiddenInGame;
+            snapshot.OriginalTickEnabled = SkyAtmosphereComponent->IsComponentTickEnabled();
+
+            if (hideOwnerActor)
+            {
+                snapshot.OriginalActorHidden = ownerActor->bHidden;
+                snapshot.HasActorHiddenSnapshot = true;
+            }
+
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        if (hideOwnerActor)
+        {
+            ownerActor->SetActorHiddenInGame(true);
+        }
+
+        SkyAtmosphereComponent->SetVisibility(false, true);
+        SkyAtmosphereComponent->SetHiddenInGame(true, true);
+        SkyAtmosphereComponent->SetComponentTickEnabled(false);
+        SkyAtmosphereComponent->SetRenderInMainPass(false);
+        SkyAtmosphereComponent->SetAerialPerspectiveStartDepth(kAtmosphereMitigationFarDistance);
+        SkyAtmosphereComponent->SetAerialPespectiveViewDistanceScale(0.0f);
+        SkyAtmosphereComponent->SetHeightFogContribution(0.0f);
+        SkyAtmosphereComponent->SetRayleighScatteringScale(0.0f);
+        SkyAtmosphereComponent->SetMieScatteringScale(0.0f);
+
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+    static void RestoreSkyAtmosphereMitigation(SDK::USkyAtmosphereComponent* SkyAtmosphereComponent)
+    {
+        if (!IsUsableObject(SkyAtmosphereComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(SkyAtmosphereComponent);
+        const auto snapshotIt = g_SkyAtmosphereMitigationCache.find(componentKey);
+        if (snapshotIt == g_SkyAtmosphereMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        auto* const ownerActor = SkyAtmosphereComponent->GetOwner();
+        if (snapshot.HasActorHiddenSnapshot && IsUsableObject(ownerActor))
+        {
+            ownerActor->SetActorHiddenInGame(snapshot.OriginalActorHidden);
+        }
+
+        SkyAtmosphereComponent->SetVisibility(snapshot.OriginalVisible, true);
+        SkyAtmosphereComponent->SetHiddenInGame(snapshot.OriginalHiddenInGame, true);
+        SkyAtmosphereComponent->SetComponentTickEnabled(snapshot.OriginalTickEnabled);
+        SkyAtmosphereComponent->SetRenderInMainPass(snapshot.OriginalRenderInMainPass);
+        SkyAtmosphereComponent->SetAerialPerspectiveStartDepth(snapshot.OriginalAerialPerspectiveStartDepth);
+        SkyAtmosphereComponent->SetAerialPespectiveViewDistanceScale(
+            snapshot.OriginalAerialPerspectiveViewDistanceScale);
+        SkyAtmosphereComponent->SetHeightFogContribution(snapshot.OriginalHeightFogContribution);
+        SkyAtmosphereComponent->SetRayleighScatteringScale(snapshot.OriginalRayleighScatteringScale);
+        SkyAtmosphereComponent->SetMieScatteringScale(snapshot.OriginalMieScatteringScale);
+        snapshot.IsMitigated = false;
+    }
+
+    static void ApplyVolumetricCloudMitigation(SDK::UVolumetricCloudComponent* VolumetricCloudComponent)
+    {
+        if (!IsUsableObject(VolumetricCloudComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(VolumetricCloudComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_VolumetricCloudMitigationCache[componentKey];
+        auto* const ownerActor = VolumetricCloudComponent->GetOwner();
+        const bool hideOwnerActor =
+            IsUsableObject(ownerActor) && ownerActor->IsA(SDK::AVolumetricCloud::StaticClass());
+
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalTracingMaxDistance = VolumetricCloudComponent->TracingMaxDistance;
+            snapshot.OriginalTracingStartDistanceFromCamera =
+                VolumetricCloudComponent->TracingStartDistanceFromCamera;
+            snapshot.OriginalTracingStartMaxDistance = VolumetricCloudComponent->TracingStartMaxDistance;
+            snapshot.OriginalViewSampleCountScale = VolumetricCloudComponent->ViewSampleCountScale;
+            snapshot.OriginalShadowViewSampleCountScale = VolumetricCloudComponent->ShadowViewSampleCountScale;
+            snapshot.OriginalShadowTracingDistance = VolumetricCloudComponent->ShadowTracingDistance;
+            snapshot.OriginalSkyLightCloudBottomOcclusion =
+                VolumetricCloudComponent->SkyLightCloudBottomOcclusion;
+            snapshot.OriginalUsePerSampleAtmosphericLightTransmittance =
+                VolumetricCloudComponent->bUsePerSampleAtmosphericLightTransmittance;
+            snapshot.OriginalRenderInMainPass = VolumetricCloudComponent->bRenderInMainPass;
+            snapshot.OriginalVisibleInRealTimeSkyCaptures =
+                VolumetricCloudComponent->bVisibleInRealTimeSkyCaptures;
+            snapshot.OriginalVisible = VolumetricCloudComponent->bVisible;
+            snapshot.OriginalHiddenInGame = VolumetricCloudComponent->bHiddenInGame;
+            snapshot.OriginalTickEnabled = VolumetricCloudComponent->IsComponentTickEnabled();
+
+            if (hideOwnerActor)
+            {
+                snapshot.OriginalActorHidden = ownerActor->bHidden;
+                snapshot.HasActorHiddenSnapshot = true;
+            }
+
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        if (hideOwnerActor)
+        {
+            ownerActor->SetActorHiddenInGame(true);
+        }
+
+        VolumetricCloudComponent->SetVisibility(false, true);
+        VolumetricCloudComponent->SetHiddenInGame(true, true);
+        VolumetricCloudComponent->SetComponentTickEnabled(false);
+        VolumetricCloudComponent->SetRenderInMainPass(false);
+        VolumetricCloudComponent->SetVisibleInRealTimeSkyCaptures(false);
+        VolumetricCloudComponent->SetbUsePerSampleAtmosphericLightTransmittance(false);
+        VolumetricCloudComponent->SetTracingMaxDistance(0.0f);
+        VolumetricCloudComponent->SetTracingStartDistanceFromCamera(kAtmosphereMitigationFarDistance);
+        VolumetricCloudComponent->SetTracingStartMaxDistance(0.0f);
+        VolumetricCloudComponent->SetViewSampleCountScale(0.0f);
+        VolumetricCloudComponent->SetShadowViewSampleCountScale(0.0f);
+        VolumetricCloudComponent->SetShadowTracingDistance(0.0f);
+        VolumetricCloudComponent->SetSkyLightCloudBottomOcclusion(0.0f);
+
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+    static void RestoreVolumetricCloudMitigation(SDK::UVolumetricCloudComponent* VolumetricCloudComponent)
+    {
+        if (!IsUsableObject(VolumetricCloudComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(VolumetricCloudComponent);
+        const auto snapshotIt = g_VolumetricCloudMitigationCache.find(componentKey);
+        if (snapshotIt == g_VolumetricCloudMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        auto* const ownerActor = VolumetricCloudComponent->GetOwner();
+        if (snapshot.HasActorHiddenSnapshot && IsUsableObject(ownerActor))
+        {
+            ownerActor->SetActorHiddenInGame(snapshot.OriginalActorHidden);
+        }
+
+        VolumetricCloudComponent->SetVisibility(snapshot.OriginalVisible, true);
+        VolumetricCloudComponent->SetHiddenInGame(snapshot.OriginalHiddenInGame, true);
+        VolumetricCloudComponent->SetComponentTickEnabled(snapshot.OriginalTickEnabled);
+        VolumetricCloudComponent->SetRenderInMainPass(snapshot.OriginalRenderInMainPass);
+        VolumetricCloudComponent->SetVisibleInRealTimeSkyCaptures(
+            snapshot.OriginalVisibleInRealTimeSkyCaptures);
+        VolumetricCloudComponent->SetbUsePerSampleAtmosphericLightTransmittance(
+            snapshot.OriginalUsePerSampleAtmosphericLightTransmittance);
+        VolumetricCloudComponent->SetTracingMaxDistance(snapshot.OriginalTracingMaxDistance);
+        VolumetricCloudComponent->SetTracingStartDistanceFromCamera(
+            snapshot.OriginalTracingStartDistanceFromCamera);
+        VolumetricCloudComponent->SetTracingStartMaxDistance(snapshot.OriginalTracingStartMaxDistance);
+        VolumetricCloudComponent->SetViewSampleCountScale(snapshot.OriginalViewSampleCountScale);
+        VolumetricCloudComponent->SetShadowViewSampleCountScale(snapshot.OriginalShadowViewSampleCountScale);
+        VolumetricCloudComponent->SetShadowTracingDistance(snapshot.OriginalShadowTracingDistance);
+        VolumetricCloudComponent->SetSkyLightCloudBottomOcclusion(
+            snapshot.OriginalSkyLightCloudBottomOcclusion);
+        snapshot.IsMitigated = false;
+    }
+
+    static void ApplyLocalFogVolumeMitigation(SDK::ULocalFogVolumeComponent* LocalFogVolumeComponent)
+    {
+        if (!IsUsableObject(LocalFogVolumeComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(LocalFogVolumeComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_LocalFogVolumeMitigationCache[componentKey];
+        auto* const ownerActor = LocalFogVolumeComponent->GetOwner();
+        const bool hideOwnerActor =
+            IsUsableObject(ownerActor) && ownerActor->IsA(SDK::ALocalFogVolume::StaticClass());
+
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalRadialFogExtinction = LocalFogVolumeComponent->RadialFogExtinction;
+            snapshot.OriginalHeightFogExtinction = LocalFogVolumeComponent->HeightFogExtinction;
+            snapshot.OriginalVisible = LocalFogVolumeComponent->bVisible;
+            snapshot.OriginalHiddenInGame = LocalFogVolumeComponent->bHiddenInGame;
+            snapshot.OriginalTickEnabled = LocalFogVolumeComponent->IsComponentTickEnabled();
+
+            if (hideOwnerActor)
+            {
+                snapshot.OriginalActorHidden = ownerActor->bHidden;
+                snapshot.HasActorHiddenSnapshot = true;
+            }
+
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        if (hideOwnerActor)
+        {
+            ownerActor->SetActorHiddenInGame(true);
+        }
+
+        LocalFogVolumeComponent->SetVisibility(false, true);
+        LocalFogVolumeComponent->SetHiddenInGame(true, true);
+        LocalFogVolumeComponent->SetComponentTickEnabled(false);
+        LocalFogVolumeComponent->SetRadialFogExtinction(0.0f);
+        LocalFogVolumeComponent->SetHeightFogExtinction(0.0f);
+
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+    static void RestoreLocalFogVolumeMitigation(SDK::ULocalFogVolumeComponent* LocalFogVolumeComponent)
+    {
+        if (!IsUsableObject(LocalFogVolumeComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(LocalFogVolumeComponent);
+        const auto snapshotIt = g_LocalFogVolumeMitigationCache.find(componentKey);
+        if (snapshotIt == g_LocalFogVolumeMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        auto* const ownerActor = LocalFogVolumeComponent->GetOwner();
+        if (snapshot.HasActorHiddenSnapshot && IsUsableObject(ownerActor))
+        {
+            ownerActor->SetActorHiddenInGame(snapshot.OriginalActorHidden);
+        }
+
+        LocalFogVolumeComponent->SetVisibility(snapshot.OriginalVisible, true);
+        LocalFogVolumeComponent->SetHiddenInGame(snapshot.OriginalHiddenInGame, true);
+        LocalFogVolumeComponent->SetComponentTickEnabled(snapshot.OriginalTickEnabled);
+        LocalFogVolumeComponent->SetRadialFogExtinction(snapshot.OriginalRadialFogExtinction);
+        LocalFogVolumeComponent->SetHeightFogExtinction(snapshot.OriginalHeightFogExtinction);
+        snapshot.IsMitigated = false;
+    }
+
+    static void ApplySkyLightCloudMitigation(SDK::USkyLightComponent* SkyLightComponent)
+    {
+        if (!IsUsableObject(SkyLightComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(SkyLightComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_SkyLightCloudMitigationCache[componentKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalRealTimeCapture = SkyLightComponent->bRealTimeCapture;
+            snapshot.OriginalCloudAmbientOcclusion = SkyLightComponent->bCloudAmbientOcclusion;
+            snapshot.OriginalCloudAmbientOcclusionStrength = SkyLightComponent->CloudAmbientOcclusionStrength;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        SkyLightComponent->SetRealTimeCapture(false);
+        SkyLightComponent->bCloudAmbientOcclusion = false;
+        SkyLightComponent->CloudAmbientOcclusionStrength = 0.0f;
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+    static void RestoreSkyLightCloudMitigation(SDK::USkyLightComponent* SkyLightComponent)
+    {
+        if (!IsUsableObject(SkyLightComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(SkyLightComponent);
+        const auto snapshotIt = g_SkyLightCloudMitigationCache.find(componentKey);
+        if (snapshotIt == g_SkyLightCloudMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        SkyLightComponent->SetRealTimeCapture(snapshot.OriginalRealTimeCapture);
+        SkyLightComponent->bCloudAmbientOcclusion = snapshot.OriginalCloudAmbientOcclusion;
+        SkyLightComponent->CloudAmbientOcclusionStrength = snapshot.OriginalCloudAmbientOcclusionStrength;
+        snapshot.IsMitigated = false;
+    }
+
+    static void ApplyDirectionalLightCloudMitigation(SDK::UDirectionalLightComponent* DirectionalLightComponent)
+    {
+        if (!IsUsableObject(DirectionalLightComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(DirectionalLightComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_DirectionalLightCloudMitigationCache[componentKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalCastShadowsOnClouds = DirectionalLightComponent->bCastShadowsOnClouds;
+            snapshot.OriginalCastShadowsOnAtmosphere = DirectionalLightComponent->bCastShadowsOnAtmosphere;
+            snapshot.OriginalCastCloudShadows = DirectionalLightComponent->bCastCloudShadows;
+            snapshot.OriginalCloudShadowStrength = DirectionalLightComponent->CloudShadowStrength;
+            snapshot.OriginalCloudShadowOnAtmosphereStrength =
+                DirectionalLightComponent->CloudShadowOnAtmosphereStrength;
+            snapshot.OriginalCloudShadowOnSurfaceStrength =
+                DirectionalLightComponent->CloudShadowOnSurfaceStrength;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        DirectionalLightComponent->bCastShadowsOnClouds = false;
+        DirectionalLightComponent->bCastShadowsOnAtmosphere = false;
+        DirectionalLightComponent->bCastCloudShadows = false;
+        DirectionalLightComponent->CloudShadowStrength = 0.0f;
+        DirectionalLightComponent->CloudShadowOnAtmosphereStrength = 0.0f;
+        DirectionalLightComponent->CloudShadowOnSurfaceStrength = 0.0f;
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+    static void RestoreDirectionalLightCloudMitigation(SDK::UDirectionalLightComponent* DirectionalLightComponent)
+    {
+        if (!IsUsableObject(DirectionalLightComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(DirectionalLightComponent);
+        const auto snapshotIt = g_DirectionalLightCloudMitigationCache.find(componentKey);
+        if (snapshotIt == g_DirectionalLightCloudMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        DirectionalLightComponent->bCastShadowsOnClouds = snapshot.OriginalCastShadowsOnClouds;
+        DirectionalLightComponent->bCastShadowsOnAtmosphere = snapshot.OriginalCastShadowsOnAtmosphere;
+        DirectionalLightComponent->bCastCloudShadows = snapshot.OriginalCastCloudShadows;
+        DirectionalLightComponent->CloudShadowStrength = snapshot.OriginalCloudShadowStrength;
+        DirectionalLightComponent->CloudShadowOnAtmosphereStrength =
+            snapshot.OriginalCloudShadowOnAtmosphereStrength;
+        DirectionalLightComponent->CloudShadowOnSurfaceStrength =
+            snapshot.OriginalCloudShadowOnSurfaceStrength;
+        snapshot.IsMitigated = false;
+    }
+
+    static void ApplyNiagaraEffectMitigation(SDK::UNiagaraComponent* NiagaraComponent)
+    {
+        if (!IsUsableObject(NiagaraComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(NiagaraComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_NiagaraEffectMitigationCache[componentKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalAutoActivate = NiagaraComponent->bAutoActivate;
+            snapshot.OriginalActive = NiagaraComponent->IsActive();
+            snapshot.OriginalTickEnabled = NiagaraComponent->IsComponentTickEnabled();
+            snapshot.OriginalVisible = NiagaraComponent->bVisible;
+            snapshot.OriginalHiddenInGame = NiagaraComponent->bHiddenInGame;
+            snapshot.OriginalRenderingEnabled = NiagaraComponent->bRenderingEnabled;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsMitigated)
+        {
+            return;
+        }
+
+        NiagaraComponent->SetAutoActivate(false);
+        NiagaraComponent->SetComponentTickEnabled(false);
+        NiagaraComponent->SetVisibility(false, true);
+        NiagaraComponent->SetHiddenInGame(true, true);
+        NiagaraComponent->bRenderingEnabled = false;
+        NiagaraComponent->Deactivate();
+        NiagaraComponent->SetActive(false, false);
+
+        snapshot.IsMitigated = true;
+        g_AtmosphereEffectMitigationHasAppliedState = true;
+    }
+
+static void RestoreNiagaraEffectMitigation(SDK::UNiagaraComponent* NiagaraComponent)
+{
+        if (!IsUsableObject(NiagaraComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(NiagaraComponent);
+        const auto snapshotIt = g_NiagaraEffectMitigationCache.find(componentKey);
+        if (snapshotIt == g_NiagaraEffectMitigationCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot)
+        {
+            return;
+        }
+
+        NiagaraComponent->bRenderingEnabled = snapshot.OriginalRenderingEnabled;
+        NiagaraComponent->SetVisibility(snapshot.OriginalVisible, true);
+        NiagaraComponent->SetHiddenInGame(snapshot.OriginalHiddenInGame, true);
+        NiagaraComponent->SetComponentTickEnabled(snapshot.OriginalTickEnabled);
+        NiagaraComponent->SetAutoActivate(snapshot.OriginalAutoActivate);
+
+        if (snapshot.OriginalActive)
+        {
+            NiagaraComponent->Activate(false);
+        }
+        else
+        {
+            NiagaraComponent->Deactivate();
+            NiagaraComponent->SetActive(false, false);
+        }
+
+        snapshot.IsMitigated = false;
+    }
+
+    static void RestoreSceneColorAtmosphereMitigationState()
+    {
+        for (auto& fogEntry : g_ExponentialHeightFogMitigationCache)
+        {
+            if (auto* const fogComponent = ResolveTrackedObject<SDK::UExponentialHeightFogComponent>(fogEntry.first))
+            {
+                RestoreExponentialHeightFogMitigation(fogComponent);
+            }
+        }
+
+        for (auto& skyEntry : g_SkyAtmosphereMitigationCache)
+        {
+            if (auto* const skyComponent = ResolveTrackedObject<SDK::USkyAtmosphereComponent>(skyEntry.first))
+            {
+                RestoreSkyAtmosphereMitigation(skyComponent);
+            }
+        }
+
+        for (auto& volumetricEntry : g_VolumetricCloudMitigationCache)
+        {
+            if (auto* const volumetricComponent = ResolveTrackedObject<SDK::UVolumetricCloudComponent>(volumetricEntry.first))
+            {
+                RestoreVolumetricCloudMitigation(volumetricComponent);
+            }
+        }
+
+        for (auto& localFogEntry : g_LocalFogVolumeMitigationCache)
+        {
+            if (auto* const localFogComponent = ResolveTrackedObject<SDK::ULocalFogVolumeComponent>(localFogEntry.first))
+            {
+                RestoreLocalFogVolumeMitigation(localFogComponent);
+            }
+        }
+
+        for (auto& skyLightEntry : g_SkyLightCloudMitigationCache)
+        {
+            if (auto* const skyLightComponent = ResolveTrackedObject<SDK::USkyLightComponent>(skyLightEntry.first))
+            {
+                RestoreSkyLightCloudMitigation(skyLightComponent);
+            }
+        }
+
+        for (auto& directionalLightEntry : g_DirectionalLightCloudMitigationCache)
+        {
+            if (auto* const directionalLightComponent =
+                    ResolveTrackedObject<SDK::UDirectionalLightComponent>(directionalLightEntry.first))
+            {
+                RestoreDirectionalLightCloudMitigation(directionalLightComponent);
+            }
+        }
+
+        g_ExponentialHeightFogMitigationCache.clear();
+        g_SkyAtmosphereMitigationCache.clear();
+        g_VolumetricCloudMitigationCache.clear();
+        g_LocalFogVolumeMitigationCache.clear();
+        g_SkyLightCloudMitigationCache.clear();
+        g_DirectionalLightCloudMitigationCache.clear();
+        g_CachedExponentialHeightFogKeySet.clear();
+        g_CachedSkyAtmosphereKeySet.clear();
+        g_CachedVolumetricCloudKeySet.clear();
+        g_CachedLocalFogVolumeKeySet.clear();
+        g_CachedSkyLightKeySet.clear();
+        g_CachedDirectionalLightKeySet.clear();
+        g_CachedExponentialHeightFogComponents.clear();
+        g_CachedSkyAtmosphereComponents.clear();
+        g_CachedVolumetricCloudComponents.clear();
+        g_CachedLocalFogVolumeComponents.clear();
+        g_CachedSkyLightComponents.clear();
+        g_CachedDirectionalLightComponents.clear();
+    }
+
+    static void RestoreAllAtmosphereEffectMitigationState()
+    {
+        RestoreSceneColorAtmosphereMitigationState();
+
+        for (auto& niagaraEntry : g_NiagaraEffectMitigationCache)
+        {
+            if (auto* const niagaraComponent = ResolveTrackedObject<SDK::UNiagaraComponent>(niagaraEntry.first))
+            {
+                RestoreNiagaraEffectMitigation(niagaraComponent);
+            }
+        }
+
+        g_NiagaraEffectMitigationCache.clear();
+        g_CachedSmokeNiagaraKeySet.clear();
+        g_CachedSmokeNiagaraComponents.clear();
+        g_AtmosphereEffectMitigationHasAppliedState = false;
+    }
+
+    static void RefreshAtmosphereEffectMitigation(
+        SDK::UWorld* World,
+        bool bEnableMitigation)
+    {
+        static SDK::UWorld* s_LastAtmosphereMitigationWorld = nullptr;
+        static bool s_LastAtmosphereMitigationEnabled = false;
+        static ULONGLONG s_LastAtmosphereMitigationScanTick = 0;
+
+        const bool needsRestorePass = !bEnableMitigation && g_AtmosphereEffectMitigationHasAppliedState;
+        if (!World)
+        {
+            if (g_AtmosphereEffectMitigationHasAppliedState)
+            {
+                RestoreAllAtmosphereEffectMitigationState();
+            }
+
+            s_LastAtmosphereMitigationWorld = nullptr;
+            s_LastAtmosphereMitigationEnabled = false;
+            s_LastAtmosphereMitigationScanTick = 0;
+            return;
+        }
+
+        if (!bEnableMitigation && !needsRestorePass)
+        {
+            return;
+        }
+
+        const ULONGLONG nowTick = GetTickCount64();
+        const bool worldChanged = s_LastAtmosphereMitigationWorld != World;
+        const bool mitigationToggled = s_LastAtmosphereMitigationEnabled != bEnableMitigation;
+        const bool scanExpired =
+            nowTick >= s_LastAtmosphereMitigationScanTick &&
+            (nowTick - s_LastAtmosphereMitigationScanTick) >= 1500;
+        if (!worldChanged && !mitigationToggled && !scanExpired)
+        {
+            return;
+        }
+
+        if (worldChanged)
+        {
+            RestoreAllAtmosphereEffectMitigationState();
+        }
+
+        if (!bEnableMitigation)
+        {
+            RestoreAllAtmosphereEffectMitigationState();
+            s_LastAtmosphereMitigationWorld = World;
+            s_LastAtmosphereMitigationEnabled = false;
+            s_LastAtmosphereMitigationScanTick = nowTick;
+            return;
+        }
+
+        if (worldChanged || mitigationToggled || scanExpired)
+        {
+            RestoreSceneColorAtmosphereMitigationState();
+
+            std::vector<SDK::ULevel*> levels;
+            CollectWorldLevels(World, &levels);
+            for (SDK::ULevel* Level : levels)
+            {
+                if (!Level || !ISVALID(Level))
+                {
+                    continue;
+                }
+
+                TArray<SDK::AActor*>& actors = Level->Actors;
+                for (SDK::AActor* Actor : actors)
+                {
+                    if (!IsUsableObject(Actor))
+                    {
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::ABP_Environment_C::StaticClass()))
+                    {
+                        auto* const environmentActor = static_cast<SDK::ABP_Environment_C*>(Actor);
+                        CacheTrackedObject(
+                            environmentActor->Sky_Atmosphere_Component,
+                            &g_CachedSkyAtmosphereKeySet,
+                            &g_CachedSkyAtmosphereComponents);
+                        if (IsUsableObject(environmentActor->SkyAtmosphere))
+                        {
+                            CacheTrackedObject(
+                                environmentActor->SkyAtmosphere->SkyAtmosphereComponent,
+                                &g_CachedSkyAtmosphereKeySet,
+                                &g_CachedSkyAtmosphereComponents);
+                        }
+
+                        CacheTrackedObject(
+                            environmentActor->Volumetric_Cloud_Component,
+                            &g_CachedVolumetricCloudKeySet,
+                            &g_CachedVolumetricCloudComponents);
+                        if (IsUsableObject(environmentActor->Volumetric_Cloud))
+                        {
+                            CacheTrackedObject(
+                                environmentActor->Volumetric_Cloud->VolumetricCloudComponent,
+                                &g_CachedVolumetricCloudKeySet,
+                                &g_CachedVolumetricCloudComponents);
+                        }
+
+                        if (IsUsableObject(environmentActor->ExponentialHeightFog))
+                        {
+                            CacheTrackedObject(
+                                environmentActor->ExponentialHeightFog->Component,
+                                &g_CachedExponentialHeightFogKeySet,
+                                &g_CachedExponentialHeightFogComponents);
+                        }
+
+                        CacheTrackedObject(
+                            environmentActor->SkyLight_Component,
+                            &g_CachedSkyLightKeySet,
+                            &g_CachedSkyLightComponents);
+                        if (IsUsableObject(environmentActor->SkyLight))
+                        {
+                            CacheTrackedObject(
+                                environmentActor->SkyLight->LightComponent,
+                                &g_CachedSkyLightKeySet,
+                                &g_CachedSkyLightComponents);
+                        }
+
+                        if (IsUsableObject(environmentActor->DirLight_Component) &&
+                            environmentActor->DirLight_Component->IsA(SDK::UDirectionalLightComponent::StaticClass()))
+                        {
+                            CacheTrackedObject(
+                                static_cast<SDK::UDirectionalLightComponent*>(environmentActor->DirLight_Component),
+                                &g_CachedDirectionalLightKeySet,
+                                &g_CachedDirectionalLightComponents);
+                        }
+                        else if (IsUsableObject(environmentActor->DirectionalLight) &&
+                                 IsUsableObject(environmentActor->DirectionalLight->LightComponent) &&
+                                 environmentActor->DirectionalLight->LightComponent->IsA(
+                                     SDK::UDirectionalLightComponent::StaticClass()))
+                        {
+                            CacheTrackedObject(
+                                static_cast<SDK::UDirectionalLightComponent*>(
+                                    environmentActor->DirectionalLight->LightComponent),
+                                &g_CachedDirectionalLightKeySet,
+                                &g_CachedDirectionalLightComponents);
+                        }
+                    }
+
+                    if (Actor->IsA(SDK::AExponentialHeightFog::StaticClass()))
+                    {
+                        auto* const fogActor = static_cast<SDK::AExponentialHeightFog*>(Actor);
+                        CacheTrackedObject(
+                            fogActor->Component,
+                            &g_CachedExponentialHeightFogKeySet,
+                            &g_CachedExponentialHeightFogComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::ASkyAtmosphere::StaticClass()))
+                    {
+                        auto* const skyAtmosphereActor = static_cast<SDK::ASkyAtmosphere*>(Actor);
+                        CacheTrackedObject(
+                            skyAtmosphereActor->SkyAtmosphereComponent,
+                            &g_CachedSkyAtmosphereKeySet,
+                            &g_CachedSkyAtmosphereComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::AAtmosphericFog::StaticClass()))
+                    {
+                        auto* const atmosphericFogActor = static_cast<SDK::AAtmosphericFog*>(Actor);
+                        CacheTrackedObject(
+                            static_cast<SDK::USkyAtmosphereComponent*>(atmosphericFogActor->AtmosphericFogComponent),
+                            &g_CachedSkyAtmosphereKeySet,
+                            &g_CachedSkyAtmosphereComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::AVolumetricCloud::StaticClass()))
+                    {
+                        auto* const volumetricCloudActor = static_cast<SDK::AVolumetricCloud*>(Actor);
+                        CacheTrackedObject(
+                            volumetricCloudActor->VolumetricCloudComponent,
+                            &g_CachedVolumetricCloudKeySet,
+                            &g_CachedVolumetricCloudComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::ALocalFogVolume::StaticClass()))
+                    {
+                        auto* const localFogVolumeActor = static_cast<SDK::ALocalFogVolume*>(Actor);
+                        CacheTrackedObject(
+                            localFogVolumeActor->LocalFogVolumeVolume,
+                            &g_CachedLocalFogVolumeKeySet,
+                            &g_CachedLocalFogVolumeComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::ABP_BaseTank_C::StaticClass()))
+                    {
+                        auto* const tankActor = static_cast<SDK::ABP_BaseTank_C*>(Actor);
+                        CacheTrackedObject(
+                            tankActor->FXS_EngineSmoke,
+                            &g_CachedSmokeNiagaraKeySet,
+                            &g_CachedSmokeNiagaraComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::ABP_BaseTank_Destroyed_C::StaticClass()))
+                    {
+                        auto* const destroyedTankActor = static_cast<SDK::ABP_BaseTank_Destroyed_C*>(Actor);
+                        CacheTrackedObject(
+                            destroyedTankActor->FXS_DestroyedTankFire,
+                            &g_CachedSmokeNiagaraKeySet,
+                            &g_CachedSmokeNiagaraComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::AGC_SmokeWall_Blind_C::StaticClass()))
+                    {
+                        auto* const smokeWallBlindActor = static_cast<SDK::AGC_SmokeWall_Blind_C*>(Actor);
+                        CacheTrackedObject(
+                            smokeWallBlindActor->SpawnedSystem,
+                            &g_CachedSmokeNiagaraKeySet,
+                            &g_CachedSmokeNiagaraComponents);
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::AGC_SmokeWall_Camo_C::StaticClass()))
+                    {
+                        auto* const smokeWallCamoActor = static_cast<SDK::AGC_SmokeWall_Camo_C*>(Actor);
+                        CacheTrackedObject(
+                            smokeWallCamoActor->SpawnedSystem,
+                            &g_CachedSmokeNiagaraKeySet,
+                            &g_CachedSmokeNiagaraComponents);
+                    }
+                }
+            }
+        }
+
+        ForEachResolvedTrackedObject<SDK::UNiagaraComponent>(
+            &g_CachedSmokeNiagaraComponents,
+            &g_CachedSmokeNiagaraKeySet,
+            [](SDK::UNiagaraComponent* SmokeNiagaraComponent)
+            {
+                ApplyNiagaraEffectMitigation(SmokeNiagaraComponent);
+            });
+
+        s_LastAtmosphereMitigationWorld = World;
+        s_LastAtmosphereMitigationEnabled = true;
+        s_LastAtmosphereMitigationScanTick = nowTick;
+    }
+
+    static void ApplyRenderDistancePolicyToPrimitive(
+        SDK::UPrimitiveComponent* Primitive,
+        float MinimumRenderDistanceCm)
+    {
+        if (!IsUsableObject(Primitive))
+        {
+            return;
+        }
+
+        const TrackedObjectKey primitiveKey = MakeTrackedObjectKey(Primitive);
+        if (!IsTrackedObjectKeyValid(primitiveKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_RenderPersistencePrimitiveCache[primitiveKey];
+        CaptureRenderPersistencePrimitiveSnapshot(Primitive, &snapshot);
+        ApplyVisibilityPersistenceToPrimitive(Primitive);
+        if (snapshot.IsDistanceCullForced)
+        {
+            return;
+        }
+
+        Primitive->MinDrawDistance = 0.0f;
+        Primitive->bAllowCullDistanceVolume = false;
+        const bool disableDistanceCulling = MinimumRenderDistanceCm <= 0.0f;
+        float desiredMaxDrawDistance = disableDistanceCulling ? 0.0f : MinimumRenderDistanceCm;
+        if (desiredMaxDrawDistance < 0.0f)
+        {
+            desiredMaxDrawDistance = 0.0f;
+        }
+
+        Primitive->bNeverDistanceCull = disableDistanceCulling;
+        Primitive->LDMaxDrawDistance = desiredMaxDrawDistance;
+        Primitive->CachedMaxDrawDistance = desiredMaxDrawDistance;
+        if (Primitive->BoundsScale < 1.20f)
+        {
+            Primitive->BoundsScale = 1.20f;
+        }
+        Primitive->SetCullDistance(desiredMaxDrawDistance);
+
+        if (Primitive->IsA(SDK::UMeshComponent::StaticClass()))
+        {
+            auto* const meshComponent = static_cast<SDK::UMeshComponent*>(Primitive);
+            meshComponent->SetOverlayMaterialMaxDrawDistance(desiredMaxDrawDistance);
+        }
+
+        if (Primitive->IsA(SDK::UInstancedStaticMeshComponent::StaticClass()))
+        {
+            auto* const instancedMeshComponent = static_cast<SDK::UInstancedStaticMeshComponent*>(Primitive);
+            int32 startCullDistance = 0;
+            int32 desiredEndCullDistance = 0;
+            if (!disableDistanceCulling)
+            {
+                startCullDistance = instancedMeshComponent->InstanceMinDrawDistance;
+                if (startCullDistance < 0)
+                {
+                    startCullDistance = 0;
+                }
+
+                desiredEndCullDistance = static_cast<int32>(desiredMaxDrawDistance);
+            }
+
+            instancedMeshComponent->SetCullDistances(startCullDistance, desiredEndCullDistance);
+        }
+
+        snapshot.IsDistanceCullForced = true;
+    }
+
+    static void ApplyRenderDistancePolicyToActor(
+        SDK::AActor* Actor,
+        float MinimumRenderDistanceCm)
+    {
+        if (!IsUsableObject(Actor))
+        {
+            return;
+        }
+
+        SDK::TArray<SDK::UActorComponent*> primitiveComponents =
+            Actor->K2_GetComponentsByClass(SDK::UPrimitiveComponent::StaticClass());
+        const int32 primitiveCount = primitiveComponents.Num();
+        for (int32 componentIndex = 0; componentIndex < primitiveCount; ++componentIndex)
+        {
+            auto* const primitiveComponent = static_cast<SDK::UPrimitiveComponent*>(primitiveComponents[componentIndex]);
+            ApplyRenderDistancePolicyToPrimitive(primitiveComponent, MinimumRenderDistanceCm);
+        }
+    }
+
+    static void ApplyVegetationInstancedCullState(
+        SDK::UInstancedStaticMeshComponent* InstancedMeshComponent,
+        bool bEnableOptimization)
+    {
+        if (!IsUsableObject(InstancedMeshComponent))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(InstancedMeshComponent);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_VegetationInstancedCullCache[componentKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalStartCullDistance = InstancedMeshComponent->InstanceMinDrawDistance;
+            snapshot.OriginalEndCullDistance = InstancedMeshComponent->InstanceEndCullDistance;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsOptimized == bEnableOptimization)
+        {
+            return;
+        }
+
+        constexpr int32 kOptimizedVegetationEndCullDistance = 6000;
+        if (bEnableOptimization)
+        {
+            int32 optimizedEndCullDistance = snapshot.OriginalEndCullDistance;
+            if (optimizedEndCullDistance <= 0 || optimizedEndCullDistance > kOptimizedVegetationEndCullDistance)
+            {
+                optimizedEndCullDistance = kOptimizedVegetationEndCullDistance;
+            }
+
+            InstancedMeshComponent->SetCullDistances(0, optimizedEndCullDistance);
+            snapshot.IsOptimized = true;
+            g_VegetationOptimizationHasAppliedState = true;
+        }
+        else if (snapshot.IsOptimized)
+        {
+            InstancedMeshComponent->SetCullDistances(snapshot.OriginalStartCullDistance, snapshot.OriginalEndCullDistance);
+            snapshot.IsOptimized = false;
+        }
+    }
+
+    static void ApplyVegetationPrimitiveCullState(
+        SDK::UPrimitiveComponent* Primitive,
+        bool bEnableOptimization)
+    {
+        if (!IsUsableObject(Primitive))
+        {
+            return;
+        }
+
+        const TrackedObjectKey componentKey = MakeTrackedObjectKey(Primitive);
+        if (!IsTrackedObjectKeyValid(componentKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_VegetationPrimitiveCullCache[componentKey];
+        if (!snapshot.HasSnapshot)
+        {
+            snapshot.OriginalMinDrawDistance = Primitive->MinDrawDistance;
+            snapshot.OriginalLDMaxDrawDistance = Primitive->LDMaxDrawDistance;
+            snapshot.OriginalCachedMaxDrawDistance = Primitive->CachedMaxDrawDistance;
+            snapshot.OriginalBoundsScale = Primitive->BoundsScale;
+            snapshot.OriginalAllowCullDistanceVolume = Primitive->bAllowCullDistanceVolume;
+            snapshot.OriginalNeverDistanceCull = Primitive->bNeverDistanceCull;
+            snapshot.HasSnapshot = true;
+        }
+
+        if (snapshot.IsOptimized == bEnableOptimization)
+        {
+            return;
+        }
+
+        constexpr float kOptimizedVegetationCullDistance = 6000.0f;
+        if (bEnableOptimization)
+        {
+            Primitive->MinDrawDistance = 0.0f;
+            Primitive->bAllowCullDistanceVolume = false;
+            Primitive->bNeverDistanceCull = false;
+            float optimizedCullDistance = snapshot.OriginalLDMaxDrawDistance;
+            if (optimizedCullDistance <= 0.0f || optimizedCullDistance > kOptimizedVegetationCullDistance)
+            {
+                optimizedCullDistance = kOptimizedVegetationCullDistance;
+            }
+
+            Primitive->LDMaxDrawDistance = optimizedCullDistance;
+            Primitive->CachedMaxDrawDistance = optimizedCullDistance;
+            Primitive->SetCullDistance(optimizedCullDistance);
+            snapshot.IsOptimized = true;
+            g_VegetationOptimizationHasAppliedState = true;
+        }
+        else if (snapshot.IsOptimized)
+        {
+            Primitive->MinDrawDistance = snapshot.OriginalMinDrawDistance;
+            Primitive->LDMaxDrawDistance = snapshot.OriginalLDMaxDrawDistance;
+            Primitive->CachedMaxDrawDistance = snapshot.OriginalCachedMaxDrawDistance;
+            Primitive->BoundsScale = snapshot.OriginalBoundsScale;
+            Primitive->bAllowCullDistanceVolume = snapshot.OriginalAllowCullDistanceVolume;
+            Primitive->bNeverDistanceCull = snapshot.OriginalNeverDistanceCull;
+            Primitive->SetCullDistance(snapshot.OriginalLDMaxDrawDistance);
+            snapshot.IsOptimized = false;
+        }
+    }
+
+    static void ApplyApproximateVegetationAlphaToMaterial(
+        SDK::UMaterialInstanceDynamic* MaterialInstanceDynamic,
+        float AlphaValue)
+    {
+        if (!IsUsableObject(MaterialInstanceDynamic))
+        {
+            return;
+        }
+
+        static const wchar_t* kScalarParameterNames[] =
+        {
+            L"Fade",
+            L"FadeAlpha",
+            L"FadeAmount",
+            L"VisibilityAlpha",
+            L"SniperFade"
+        };
+
+        for (const wchar_t* parameterName : kScalarParameterNames)
+        {
+            if (!parameterName)
+            {
+                continue;
+            }
+
+            MaterialInstanceDynamic->SetScalarParameterValue(MakeNameFromWide(parameterName), AlphaValue);
+        }
+    }
+
+    static void CaptureVegetationPrimitiveAlphaSnapshot(
+        SDK::UPrimitiveComponent* Primitive,
+        VegetationPrimitiveAlphaSnapshot* Snapshot)
+    {
+        if (!IsUsableObject(Primitive) || !Snapshot || Snapshot->HasSnapshot)
+        {
+            return;
+        }
+
+        Snapshot->OriginalCustomPrimitiveData.clear();
+        const int32 originalCustomPrimitiveCount = Primitive->CustomPrimitiveData.Data.Num();
+        Snapshot->OriginalCustomPrimitiveData.reserve(static_cast<size_t>(originalCustomPrimitiveCount));
+        for (int32 dataIndex = 0; dataIndex < originalCustomPrimitiveCount; ++dataIndex)
+        {
+            Snapshot->OriginalCustomPrimitiveData.push_back(Primitive->CustomPrimitiveData.Data[dataIndex]);
+        }
+
+        static const wchar_t* kCustomPrimitiveDataNames[] =
+        {
+            L"Fade",
+            L"FadeAlpha",
+            L"FadeAmount",
+            L"VisibilityAlpha",
+            L"SniperFade"
+        };
+
+        Snapshot->TouchedCustomPrimitiveIndices.clear();
+        for (const wchar_t* parameterName : kCustomPrimitiveDataNames)
+        {
+            if (!parameterName)
+            {
+                continue;
+            }
+
+            const int32 primitiveDataIndex =
+                Primitive->GetCustomPrimitiveDataIndexForScalarParameter(MakeNameFromWide(parameterName));
+            if (primitiveDataIndex < 0)
+            {
+                continue;
+            }
+
+            if (std::find(
+                    Snapshot->TouchedCustomPrimitiveIndices.begin(),
+                    Snapshot->TouchedCustomPrimitiveIndices.end(),
+                    primitiveDataIndex) == Snapshot->TouchedCustomPrimitiveIndices.end())
+            {
+                Snapshot->TouchedCustomPrimitiveIndices.push_back(primitiveDataIndex);
+            }
+        }
+
+        const int32 numMaterials = Primitive->GetNumMaterials();
+        Snapshot->MaterialSlots.clear();
+        Snapshot->MaterialSlots.resize(static_cast<size_t>(numMaterials));
+
+        static const wchar_t* kScalarParameterNames[] =
+        {
+            L"Fade",
+            L"FadeAlpha",
+            L"FadeAmount",
+            L"VisibilityAlpha",
+            L"SniperFade"
+        };
+        constexpr size_t kScalarParameterNameCount =
+            sizeof(kScalarParameterNames) / sizeof(kScalarParameterNames[0]);
+
+        for (int32 materialIndex = 0; materialIndex < numMaterials; ++materialIndex)
+        {
+            auto& materialSnapshot = Snapshot->MaterialSlots[static_cast<size_t>(materialIndex)];
+            materialSnapshot.OriginalMaterial = Primitive->GetMaterial(materialIndex);
+            if (!IsUsableObject(materialSnapshot.OriginalMaterial) ||
+                !materialSnapshot.OriginalMaterial->IsA(SDK::UMaterialInstanceDynamic::StaticClass()))
+            {
+                continue;
+            }
+
+            auto* const originalMid = static_cast<SDK::UMaterialInstanceDynamic*>(materialSnapshot.OriginalMaterial);
+            materialSnapshot.OriginalMaterialWasDynamic = true;
+            materialSnapshot.HasScalarSnapshot = true;
+            for (size_t parameterIndex = 0; parameterIndex < kScalarParameterNameCount; ++parameterIndex)
+            {
+                materialSnapshot.OriginalScalarValues[parameterIndex] =
+                    originalMid->K2_GetScalarParameterValue(MakeNameFromWide(kScalarParameterNames[parameterIndex]));
+            }
+        }
+
+        Snapshot->HasSnapshot = true;
+    }
+
+    static void ApplyApproximateVegetationAlphaToPrimitive(
+        SDK::UPrimitiveComponent* Primitive,
+        float AlphaValue)
+    {
+        if (!IsUsableObject(Primitive))
+        {
+            return;
+        }
+
+        const TrackedObjectKey primitiveKey = MakeTrackedObjectKey(Primitive);
+        if (!IsTrackedObjectKeyValid(primitiveKey))
+        {
+            return;
+        }
+
+        auto& snapshot = g_VegetationPrimitiveAlphaCache[primitiveKey];
+        CaptureVegetationPrimitiveAlphaSnapshot(Primitive, &snapshot);
+        if (snapshot.IsApplied)
+        {
+            return;
+        }
+
+        const int32 numMaterials = Primitive->GetNumMaterials();
+        for (int32 materialIndex = 0; materialIndex < numMaterials; ++materialIndex)
+        {
+            SDK::UMaterialInterface* materialInterface = Primitive->GetMaterial(materialIndex);
+            if (!IsUsableObject(materialInterface) ||
+                !materialInterface->IsA(SDK::UMaterialInstanceDynamic::StaticClass()))
+            {
+                continue;
+            }
+
+            auto* const materialInstanceDynamic =
+                static_cast<SDK::UMaterialInstanceDynamic*>(materialInterface);
+            ApplyApproximateVegetationAlphaToMaterial(materialInstanceDynamic, AlphaValue);
+        }
+
+        snapshot.IsApplied = true;
+    }
+
+    static void RestoreApproximateVegetationAlphaFromPrimitive(
+        SDK::UPrimitiveComponent* Primitive)
+    {
+        if (!IsUsableObject(Primitive))
+        {
+            return;
+        }
+
+        const TrackedObjectKey primitiveKey = MakeTrackedObjectKey(Primitive);
+        const auto snapshotIt = g_VegetationPrimitiveAlphaCache.find(primitiveKey);
+        if (snapshotIt == g_VegetationPrimitiveAlphaCache.end())
+        {
+            return;
+        }
+
+        auto& snapshot = snapshotIt->second;
+        if (!snapshot.HasSnapshot || !snapshot.IsApplied)
+        {
+            return;
+        }
+
+        for (size_t dataIndex = 0; dataIndex < snapshot.OriginalCustomPrimitiveData.size(); ++dataIndex)
+        {
+            Primitive->SetCustomPrimitiveDataFloat(
+                static_cast<int32>(dataIndex),
+                snapshot.OriginalCustomPrimitiveData[dataIndex]);
+        }
+
+        for (int32 touchedIndex : snapshot.TouchedCustomPrimitiveIndices)
+        {
+            if (touchedIndex < 0 ||
+                static_cast<size_t>(touchedIndex) < snapshot.OriginalCustomPrimitiveData.size())
+            {
+                continue;
+            }
+
+            Primitive->SetCustomPrimitiveDataFloat(touchedIndex, 0.0f);
+        }
+
+        static const wchar_t* kScalarParameterNames[] =
+        {
+            L"Fade",
+            L"FadeAlpha",
+            L"FadeAmount",
+            L"VisibilityAlpha",
+            L"SniperFade"
+        };
+        constexpr size_t kScalarParameterNameCount =
+            sizeof(kScalarParameterNames) / sizeof(kScalarParameterNames[0]);
+
+        const int32 numMaterials = Primitive->GetNumMaterials();
+        const size_t materialCountToRestore =
+            (std::min)(snapshot.MaterialSlots.size(), static_cast<size_t>(numMaterials));
+        for (size_t materialIndex = 0; materialIndex < materialCountToRestore; ++materialIndex)
+        {
+            auto& materialSnapshot = snapshot.MaterialSlots[materialIndex];
+            if (!IsUsableObject(materialSnapshot.OriginalMaterial))
+            {
+                continue;
+            }
+
+            Primitive->SetMaterial(static_cast<int32>(materialIndex), materialSnapshot.OriginalMaterial);
+            if (!materialSnapshot.OriginalMaterialWasDynamic || !materialSnapshot.HasScalarSnapshot)
+            {
+                continue;
+            }
+
+            auto* const originalMid =
+                static_cast<SDK::UMaterialInstanceDynamic*>(materialSnapshot.OriginalMaterial);
+            for (size_t parameterIndex = 0; parameterIndex < kScalarParameterNameCount; ++parameterIndex)
+            {
+                originalMid->SetScalarParameterValue(
+                    MakeNameFromWide(kScalarParameterNames[parameterIndex]),
+                    materialSnapshot.OriginalScalarValues[parameterIndex]);
+            }
+        }
+
+        snapshot.IsApplied = false;
+    }
+
+    static void InvokeVisionBlockerUpdateMeshRenderForSniperMode(
+        SDK::ABP_VisionBlocker_C* VisionBlocker,
+        bool bSniperModeActive)
+    {
+        if (!IsUsableObject(VisionBlocker))
+        {
+            return;
+        }
+
+        static SDK::UFunction* s_Function = nullptr;
+        if (!s_Function)
+        {
+            s_Function = VisionBlocker->Class->GetFunction("BP_VisionBlocker_C", "UpdateMeshRenderForSniperMode");
+        }
+
+        if (!s_Function)
+        {
+            return;
+        }
+
+        struct Params
+        {
+            bool bSniperModeActive = false;
+        };
+
+        Params params{};
+        params.bSniperModeActive = bSniperModeActive;
+        VisionBlocker->ProcessEvent(s_Function, &params);
+    }
+
+    static void InvokeVisionBlockerForceUpdateTransparencyForLocalPlayer(
+        SDK::ABP_VisionBlocker_C* VisionBlocker)
+    {
+        if (!IsUsableObject(VisionBlocker))
+        {
+            return;
+        }
+
+        static SDK::UFunction* s_Function = nullptr;
+        if (!s_Function)
+        {
+            s_Function = VisionBlocker->Class->GetFunction("BP_VisionBlocker_C", "ForceUpdateTransparencyForLocalPlayer");
+        }
+
+        if (s_Function)
+        {
+            VisionBlocker->ProcessEvent(s_Function, nullptr);
+        }
+    }
+
+    static void InvokeVisionBlockerUpdateBushRenderMode(
+        SDK::ABP_VisionBlocker_C* VisionBlocker)
+    {
+        if (!IsUsableObject(VisionBlocker))
+        {
+            return;
+        }
+
+        static SDK::UFunction* s_Function = nullptr;
+        if (!s_Function)
+        {
+            s_Function = VisionBlocker->Class->GetFunction("BP_VisionBlocker_C", "UpdateBushRenderMode");
+        }
+
+        if (s_Function)
+        {
+            VisionBlocker->ProcessEvent(s_Function, nullptr);
+        }
+    }
+
+    static void InvokeVisionBlockerSetMeshRenderMainPass(
+        SDK::ABP_VisionBlocker_C* VisionBlocker,
+        bool bRenderInMainPass)
+    {
+        if (!IsUsableObject(VisionBlocker))
+        {
+            return;
+        }
+
+        static SDK::UFunction* s_Function = nullptr;
+        if (!s_Function)
+        {
+            s_Function = VisionBlocker->Class->GetFunction("BP_VisionBlocker_C", "SetMeshRenderMainPass");
+        }
+
+        if (!s_Function)
+        {
+            return;
+        }
+
+        struct Params
+        {
+            bool bInRender = false;
+        };
+
+        Params params{};
+        params.bInRender = bRenderInMainPass;
+        VisionBlocker->ProcessEvent(s_Function, &params);
+    }
+
+    static void InvokeVisionBlockerUnfadeMesh(
+        SDK::ABP_VisionBlocker_C* VisionBlocker)
+    {
+        if (!IsUsableObject(VisionBlocker))
+        {
+            return;
+        }
+
+        static SDK::UFunction* s_Function = nullptr;
+        if (!s_Function)
+        {
+            s_Function = VisionBlocker->Class->GetFunction("BP_VisionBlocker_C", "Unfade_Mesh");
+        }
+
+        if (s_Function)
+        {
+            VisionBlocker->ProcessEvent(s_Function, nullptr);
+        }
+    }
+
+    static void ApplyVisionBlockerVegetationState(
+        SDK::ABP_VisionBlocker_C* VisionBlocker,
+        bool bEnableOptimization,
+        bool bSniperModeActive,
+        bool bForceNativeRefresh)
+    {
+        if (!IsUsableObject(VisionBlocker))
+        {
+            return;
+        }
+
+        const TrackedObjectKey actorKey = MakeTrackedObjectKey(VisionBlocker);
+        if (!IsTrackedObjectKeyValid(actorKey))
+        {
+            return;
+        }
+
+        auto& blockerState = g_VegetationVisionBlockerStateCache[actorKey];
+        auto& nativeSnapshot = g_VisionBlockerNativeStateCache[actorKey];
+        if (!nativeSnapshot.HasSnapshot)
+        {
+            static const wchar_t* kBushScalarParameterNames[] =
+            {
+                L"Fade",
+                L"FadeAlpha",
+                L"FadeAmount",
+                L"VisibilityAlpha",
+                L"SniperFade"
+            };
+            constexpr size_t kBushScalarParameterNameCount =
+                sizeof(kBushScalarParameterNames) / sizeof(kBushScalarParameterNames[0]);
+
+            if (IsUsableObject(VisionBlocker->FoliageVision))
+            {
+                nativeSnapshot.OriginalCamoPercentageIncreaseAmount =
+                    VisionBlocker->FoliageVision->CamoPercentageIncreaseAmount;
+                nativeSnapshot.HasFoliageVisionSnapshot = true;
+            }
+
+            if (IsUsableObject(VisionBlocker->bush_material))
+            {
+                nativeSnapshot.HasBushMaterialScalarSnapshot = true;
+                for (size_t parameterIndex = 0; parameterIndex < kBushScalarParameterNameCount; ++parameterIndex)
+                {
+                    nativeSnapshot.OriginalBushMaterialScalarValues[parameterIndex] =
+                        VisionBlocker->bush_material->K2_GetScalarParameterValue(
+                            MakeNameFromWide(kBushScalarParameterNames[parameterIndex]));
+                }
+            }
+
+            nativeSnapshot.HasSnapshot = true;
+        }
+
+        const bool needsNativeRefresh =
+            bForceNativeRefresh ||
+            blockerState != bEnableOptimization ||
+            nativeSnapshot.LastKnownSniperState != bSniperModeActive;
+
+        if (bEnableOptimization)
+        {
+            if (needsNativeRefresh)
+            {
+                InvokeVisionBlockerUpdateMeshRenderForSniperMode(VisionBlocker, bSniperModeActive);
+                InvokeVisionBlockerUnfadeMesh(VisionBlocker);
+                InvokeVisionBlockerForceUpdateTransparencyForLocalPlayer(VisionBlocker);
+                InvokeVisionBlockerUpdateBushRenderMode(VisionBlocker);
+            }
+
+            constexpr float VegetationAlpha = 0.10f;
+            ApplyApproximateVegetationAlphaToPrimitive(VisionBlocker->BushMesh, VegetationAlpha);
+            ApplyApproximateVegetationAlphaToMaterial(VisionBlocker->bush_material, VegetationAlpha);
+
+            blockerState = true;
+            nativeSnapshot.IsApplied = true;
+            nativeSnapshot.LastKnownSniperState = bSniperModeActive;
+            g_VegetationOptimizationHasAppliedState = true;
+            return;
+        }
+
+        RestoreApproximateVegetationAlphaFromPrimitive(VisionBlocker->PrepassMesh);
+        RestoreApproximateVegetationAlphaFromPrimitive(VisionBlocker->BushMeshOutline);
+        RestoreApproximateVegetationAlphaFromPrimitive(VisionBlocker->BushMesh);
+        RestoreRenderPersistenceForPrimitive(VisionBlocker->PrepassMesh);
+        RestoreRenderPersistenceForPrimitive(VisionBlocker->BushMeshOutline);
+        RestoreRenderPersistenceForPrimitive(VisionBlocker->BushMesh);
+        RestoreRenderPersistenceForActor(VisionBlocker);
+
+        if (nativeSnapshot.HasBushMaterialScalarSnapshot && IsUsableObject(VisionBlocker->bush_material))
+        {
+            static const wchar_t* kBushScalarParameterNames[] =
+            {
+                L"Fade",
+                L"FadeAlpha",
+                L"FadeAmount",
+                L"VisibilityAlpha",
+                L"SniperFade"
+            };
+            constexpr size_t kBushScalarParameterNameCount =
+                sizeof(kBushScalarParameterNames) / sizeof(kBushScalarParameterNames[0]);
+            for (size_t parameterIndex = 0; parameterIndex < kBushScalarParameterNameCount; ++parameterIndex)
+            {
+                VisionBlocker->bush_material->SetScalarParameterValue(
+                    MakeNameFromWide(kBushScalarParameterNames[parameterIndex]),
+                    nativeSnapshot.OriginalBushMaterialScalarValues[parameterIndex]);
+            }
+        }
+
+        if (needsNativeRefresh)
+        {
+            InvokeVisionBlockerUpdateMeshRenderForSniperMode(VisionBlocker, bSniperModeActive);
+            InvokeVisionBlockerForceUpdateTransparencyForLocalPlayer(VisionBlocker);
+            InvokeVisionBlockerUpdateBushRenderMode(VisionBlocker);
+        }
+
+        blockerState = false;
+        nativeSnapshot.IsApplied = false;
+        nativeSnapshot.LastKnownSniperState = bSniperModeActive;
+    }
+
+    static void RestoreAllVegetationOptimizationState(bool bSniperModeActive)
+    {
+        for (auto& blockerEntry : g_VegetationVisionBlockerStateCache)
+        {
+            if (auto* const visionBlocker = ResolveTrackedObject<SDK::ABP_VisionBlocker_C>(blockerEntry.first))
+            {
+                ApplyVisionBlockerVegetationState(visionBlocker, false, bSniperModeActive, true);
+            }
+        }
+
+        for (auto& primitiveEntry : g_VegetationPrimitiveAlphaCache)
+        {
+            if (auto* const primitive = ResolveTrackedObject<SDK::UPrimitiveComponent>(primitiveEntry.first))
+            {
+                RestoreApproximateVegetationAlphaFromPrimitive(primitive);
+            }
+        }
+
+        for (auto& instancedCullEntry : g_VegetationInstancedCullCache)
+        {
+            if (auto* const instancedPrimitive =
+                    ResolveTrackedObject<SDK::UInstancedStaticMeshComponent>(instancedCullEntry.first))
+            {
+                ApplyVegetationInstancedCullState(instancedPrimitive, false);
+            }
+        }
+
+        for (auto& primitiveCullEntry : g_VegetationPrimitiveCullCache)
+        {
+            if (auto* const primitive = ResolveTrackedObject<SDK::UPrimitiveComponent>(primitiveCullEntry.first))
+            {
+                ApplyVegetationPrimitiveCullState(primitive, false);
+            }
+        }
+
+        g_VegetationVisionBlockerStateCache.clear();
+        g_VegetationInstancedCullCache.clear();
+        g_VegetationPrimitiveCullCache.clear();
+        g_VegetationPrimitiveAlphaCache.clear();
+        g_VisionBlockerNativeStateCache.clear();
+        g_CachedVisionBlockerKeySet.clear();
+        g_CachedVegetationInstancedKeySet.clear();
+        g_CachedVegetationPrimitiveKeySet.clear();
+        g_CachedVisionBlockers.clear();
+        g_CachedVegetationInstancedComponents.clear();
+        g_CachedVegetationPrimitiveComponents.clear();
+        g_VegetationOptimizationHasAppliedState = false;
+    }
+
+    static void RefreshVegetationRenderOptimization(
+        SDK::UWorld* World,
+        bool bEnableOptimization,
+        bool bSniperModeActive)
+    {
+        static SDK::UWorld* s_LastVegetationWorld = nullptr;
+        static bool s_LastVegetationOptimizationEnabled = false;
+        static bool s_LastSniperModeState = false;
+        static ULONGLONG s_LastVegetationScanTick = 0;
+
+        const bool needsRestorePass = !bEnableOptimization && g_VegetationOptimizationHasAppliedState;
+        if (!World)
+        {
+            if (g_VegetationOptimizationHasAppliedState)
+            {
+                RestoreAllVegetationOptimizationState(s_LastSniperModeState);
+            }
+
+            s_LastVegetationWorld = nullptr;
+            s_LastVegetationOptimizationEnabled = false;
+            s_LastSniperModeState = bSniperModeActive;
+            s_LastVegetationScanTick = 0;
+            return;
+        }
+
+        if (!bEnableOptimization && !needsRestorePass)
+        {
+            return;
+        }
+
+        const ULONGLONG nowTick = GetTickCount64();
+        const bool worldChanged = s_LastVegetationWorld != World;
+        const bool optimizationToggled = s_LastVegetationOptimizationEnabled != bEnableOptimization;
+        const bool sniperStateChanged = s_LastSniperModeState != bSniperModeActive;
+        const bool scanExpired =
+            nowTick >= s_LastVegetationScanTick &&
+            (nowTick - s_LastVegetationScanTick) >= 1500;
+        if (!worldChanged && !optimizationToggled && !sniperStateChanged && !scanExpired)
+        {
+            return;
+        }
+
+        if (worldChanged)
+        {
+            RestoreAllVegetationOptimizationState(s_LastSniperModeState);
+        }
+
+        if (!bEnableOptimization)
+        {
+            RestoreAllVegetationOptimizationState(bSniperModeActive);
+            s_LastVegetationWorld = World;
+            s_LastVegetationOptimizationEnabled = false;
+            s_LastSniperModeState = bSniperModeActive;
+            s_LastVegetationScanTick = nowTick;
+            return;
+        }
+
+        if (worldChanged || optimizationToggled || scanExpired)
+        {
+            std::vector<SDK::ULevel*> levels;
+            CollectWorldLevels(World, &levels);
+            for (SDK::ULevel* Level : levels)
+            {
+                if (!Level || !ISVALID(Level))
+                {
+                    continue;
+                }
+
+                TArray<SDK::AActor*>& actors = Level->Actors;
+                for (SDK::AActor* Actor : actors)
+                {
+                    if (!IsUsableObject(Actor))
+                    {
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::ABP_VisionBlocker_C::StaticClass()))
+                    {
+                        auto* const visionBlocker = static_cast<SDK::ABP_VisionBlocker_C*>(Actor);
+                        const TrackedObjectKey visionBlockerKey = MakeTrackedObjectKey(visionBlocker);
+                        if (IsTrackedObjectKeyValid(visionBlockerKey) &&
+                            g_CachedVisionBlockerKeySet.insert(visionBlockerKey).second)
+                        {
+                            g_CachedVisionBlockers.push_back(visionBlockerKey);
+                        }
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::AInstancedFoliageActor::StaticClass()))
+                    {
+                        SDK::TArray<SDK::UActorComponent*> foliageComponents =
+                            Actor->K2_GetComponentsByClass(SDK::UFoliageInstancedStaticMeshComponent::StaticClass());
+                        const int32 foliageComponentCount = foliageComponents.Num();
+                        for (int32 componentIndex = 0; componentIndex < foliageComponentCount; ++componentIndex)
+                        {
+                            auto* const foliageComponent =
+                                static_cast<SDK::UInstancedStaticMeshComponent*>(foliageComponents[componentIndex]);
+                            const TrackedObjectKey foliageKey = MakeTrackedObjectKey(foliageComponent);
+                            if (IsTrackedObjectKeyValid(foliageKey) &&
+                                g_CachedVegetationInstancedKeySet.insert(foliageKey).second)
+                            {
+                                g_CachedVegetationInstancedComponents.push_back(foliageKey);
+                            }
+                        }
+
+                        SDK::TArray<SDK::UActorComponent*> grassComponents =
+                            Actor->K2_GetComponentsByClass(SDK::UGrassInstancedStaticMeshComponent::StaticClass());
+                        const int32 grassComponentCount = grassComponents.Num();
+                        for (int32 componentIndex = 0; componentIndex < grassComponentCount; ++componentIndex)
+                        {
+                            auto* const grassComponent =
+                                static_cast<SDK::UInstancedStaticMeshComponent*>(grassComponents[componentIndex]);
+                            const TrackedObjectKey grassKey = MakeTrackedObjectKey(grassComponent);
+                            if (IsTrackedObjectKeyValid(grassKey) &&
+                                g_CachedVegetationInstancedKeySet.insert(grassKey).second)
+                            {
+                                g_CachedVegetationInstancedComponents.push_back(grassKey);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (Actor->IsA(SDK::AInteractiveFoliageActor::StaticClass()))
+                    {
+                        auto* const foliageActor = static_cast<SDK::AInteractiveFoliageActor*>(Actor);
+                        const TrackedObjectKey primitiveKey = MakeTrackedObjectKey(foliageActor->StaticMeshComponent);
+                        if (IsTrackedObjectKeyValid(primitiveKey) &&
+                            g_CachedVegetationPrimitiveKeySet.insert(primitiveKey).second)
+                        {
+                            g_CachedVegetationPrimitiveComponents.push_back(primitiveKey);
+                        }
+                    }
+                }
+            }
+        }
+
+        ForEachResolvedTrackedObject<SDK::ABP_VisionBlocker_C>(
+            &g_CachedVisionBlockers,
+            &g_CachedVisionBlockerKeySet,
+            [bSniperModeActive, worldChanged, optimizationToggled, sniperStateChanged](
+                SDK::ABP_VisionBlocker_C* VisionBlocker)
+            {
+                ApplyVisionBlockerVegetationState(
+                    VisionBlocker,
+                    true,
+                    bSniperModeActive,
+                    worldChanged || optimizationToggled || sniperStateChanged);
+            });
+
+        constexpr float VegetationAlpha = 0.10f;
+        ForEachResolvedTrackedObject<SDK::UInstancedStaticMeshComponent>(
+            &g_CachedVegetationInstancedComponents,
+            &g_CachedVegetationInstancedKeySet,
+            [VegetationAlpha](SDK::UInstancedStaticMeshComponent* FoliageComponent)
+            {
+                ApplyApproximateVegetationAlphaToPrimitive(FoliageComponent, VegetationAlpha);
+                ApplyVegetationInstancedCullState(FoliageComponent, true);
+            });
+
+        ForEachResolvedTrackedObject<SDK::UPrimitiveComponent>(
+            &g_CachedVegetationPrimitiveComponents,
+            &g_CachedVegetationPrimitiveKeySet,
+            [VegetationAlpha](SDK::UPrimitiveComponent* FoliagePrimitive)
+            {
+                ApplyApproximateVegetationAlphaToPrimitive(FoliagePrimitive, VegetationAlpha);
+                ApplyVegetationPrimitiveCullState(FoliagePrimitive, true);
+            });
+
+        s_LastVegetationWorld = World;
+        s_LastVegetationOptimizationEnabled = true;
+        s_LastSniperModeState = bSniperModeActive;
+        s_LastVegetationScanTick = nowTick;
+    }
+
+    static void RefreshSceneRenderDistance(
+        SDK::UWorld* World,
+        SDK::ABP_BaseTank_C* SelfTank)
+    {
+        static SDK::UWorld* s_LastRenderDistanceWorld = nullptr;
+        static ULONGLONG s_LastRenderDistanceScanTick = 0;
+        if (!World)
+        {
+            if (s_LastRenderDistanceWorld)
+            {
+                RestoreAllRenderPersistenceState();
+            }
+
+            s_LastRenderDistanceWorld = nullptr;
+            s_LastRenderDistanceScanTick = 0;
+            return;
+        }
+
+        const ULONGLONG nowTick = GetTickCount64();
+        const bool worldChanged = s_LastRenderDistanceWorld != World;
+        const bool scanExpired =
+            nowTick >= s_LastRenderDistanceScanTick &&
+            (nowTick - s_LastRenderDistanceScanTick) >= 5000;
+        if (!worldChanged && !scanExpired)
+        {
+            return;
+        }
+
+        if (worldChanged)
+        {
+            RestoreAllRenderPersistenceState();
+        }
+
+        const float minimumSceneRenderDistanceCm = GetMinimumSceneRenderDistanceCm();
+        std::vector<SDK::ULevel*> levels;
+        CollectWorldLevels(World, &levels);
+        for (SDK::ULevel* Level : levels)
+        {
+            if (!Level || !ISVALID(Level))
+            {
+                continue;
+            }
+
+            TArray<SDK::AActor*>& actors = Level->Actors;
+            for (SDK::AActor* Actor : actors)
+            {
+                if (!IsUsableObject(Actor))
+                {
+                    continue;
+                }
+
+                if (Actor == SelfTank)
+                {
+                    continue;
+                }
+
+                if (Actor->IsA(SDK::ATyrSoftwareOcclusionVolume::StaticClass()))
+                {
+                    auto* const occlusionVolume = static_cast<SDK::ATyrSoftwareOcclusionVolume*>(Actor);
+                    const TrackedObjectKey occlusionKey = MakeTrackedObjectKey(occlusionVolume->OcclusionComponent);
+                    if (IsTrackedObjectKeyValid(occlusionKey) &&
+                        g_CachedSoftwareOcclusionKeySet.insert(occlusionKey).second)
+                    {
+                        g_CachedSoftwareOcclusionComponents.push_back(occlusionKey);
+                    }
+                    ApplySoftwareOcclusionDisable(occlusionVolume->OcclusionComponent);
+                    continue;
+                }
+
+                if (Actor->IsA(SDK::ABP_VisionBlocker_C::StaticClass()))
+                {
+                    auto* const visionBlocker = static_cast<SDK::ABP_VisionBlocker_C*>(Actor);
+                    const TrackedObjectKey occlusionKey = MakeTrackedObjectKey(visionBlocker->TyrSoftwareOcclusion);
+                    if (IsTrackedObjectKeyValid(occlusionKey) &&
+                        g_CachedSoftwareOcclusionKeySet.insert(occlusionKey).second)
+                    {
+                        g_CachedSoftwareOcclusionComponents.push_back(occlusionKey);
+                    }
+                    ApplySoftwareOcclusionDisable(visionBlocker->TyrSoftwareOcclusion);
+                    continue;
+                }
+
+                if (Actor->IsA(SDK::AInstancedFoliageActor::StaticClass()) ||
+                    Actor->IsA(SDK::AInteractiveFoliageActor::StaticClass()))
+                {
+                    continue;
+                }
+
+                const TrackedObjectKey actorKey = MakeTrackedObjectKey(Actor);
+                if (IsTrackedObjectKeyValid(actorKey) &&
+                    g_CachedSceneRenderActorKeySet.insert(actorKey).second)
+                {
+                    g_CachedSceneRenderActors.push_back(actorKey);
+                }
+
+                ApplyVisibilityPersistenceToActor(Actor);
+                ApplyRenderDistancePolicyToActor(Actor, minimumSceneRenderDistanceCm);
+            }
+        }
+
+        s_LastRenderDistanceWorld = World;
+        s_LastRenderDistanceScanTick = nowTick;
+    }
+
+    static void RefreshMotionSicknessMitigation(
+        SDK::UWorld* World,
+        SDK::APlayerController* PlayerController,
+        SDK::ABP_BaseTank_C* SelfTank)
+    {
+        if (!World || !PlayerController)
+        {
+            return;
+        }
+
+        static ULONGLONG s_LastGlobalMotionMitigationTick = 0;
+        const ULONGLONG nowTick = GetTickCount64();
+        const bool shouldRefreshGlobalState =
+            s_LastGlobalMotionMitigationTick == 0 ||
+            nowTick < s_LastGlobalMotionMitigationTick ||
+            (nowTick - s_LastGlobalMotionMitigationTick) >= 250;
+
+        if (shouldRefreshGlobalState)
+        {
+            s_LastGlobalMotionMitigationTick = nowTick;
+
+            auto* const sharedSettings = SDK::UTyrSettingsShared::GetLocalSharedSettings(World);
+            if (IsUsableObject(sharedSettings) && sharedSettings->GetCameraShake())
+            {
+                sharedSettings->SetCameraShake(false);
+                sharedSettings->SaveSettings();
+            }
+
+            if (PlayerController->PlayerCameraManager)
+            {
+                PlayerController->PlayerCameraManager->StopAllCameraShakes(true);
+            }
+
+            PlayerController->bForceFeedbackEnabled = false;
+            PlayerController->ForceFeedbackScale = 0.0f;
+            PlayerController->PlayDynamicForceFeedback(
+                0.0f,
+                0.0f,
+                true,
+                true,
+                true,
+                true,
+                SDK::EDynamicForceFeedbackAction::Stop,
+                SDK::FLatentActionInfo{});
+        }
+
+        if (IsUsableTank(SelfTank))
+        {
+            if (IsUsableObject(SelfTank->FXS_SpeedLines))
+            {
+                SelfTank->FXS_SpeedLines->Deactivate();
+                SelfTank->FXS_SpeedLines->SetVisibility(false, true);
+                SelfTank->FXS_SpeedLines->SetComponentTickEnabled(false);
+            }
+
+            if (IsUsableObject(SelfTank->FXS_SniperSpeedLines))
+            {
+                SelfTank->FXS_SniperSpeedLines->Deactivate();
+                SelfTank->FXS_SniperSpeedLines->SetVisibility(false, true);
+                SelfTank->FXS_SniperSpeedLines->SetComponentTickEnabled(false);
+            }
+    }
+    }
+
     static SDK::FLinearColor ResolveTrackedEntityIndicatorColor(const std::string& EntityKey);
+    static void DisableTrackedArmorVisualizationForEntityKey(const std::string& EntityKey);
+    static void DisableAllTrackedArmorVisualization();
 
     static bool TryIsEnemy(SDK::ATyrPlayerStateBase* SelfState, SDK::ATyrPlayerStateBase* OtherState, bool* OutIsEnemy)
     {
@@ -284,9 +3513,11 @@ namespace
 
     static void ClearTrackedEntityState(const std::string& EntityKey)
     {
+        DisableTrackedArmorVisualizationForEntityKey(EntityKey);
         g_LastSeenEntityCache.erase(EntityKey);
         g_ArmorVisualizationSetupCache.erase(EntityKey);
         g_TrackedEntityPenetrationCache.erase(EntityKey);
+        g_TrackedEntityReloadCache.erase(EntityKey);
     }
 
     static bool IsLivePlayerStateAlive(SDK::ATyrPlayerStateBase* PlayerState)
@@ -374,9 +3605,55 @@ namespace
         return fireOrigin;
     }
 
+    static bool IsCameraManagerSniperActive(SDK::APlayerController* PlayerController)
+    {
+        if (!IsUsableObject(PlayerController) || !IsUsableObject(PlayerController->PlayerCameraManager))
+        {
+            return false;
+        }
+
+        auto* const cameraManager = PlayerController->PlayerCameraManager;
+        static SDK::UFunction* s_IsSniperFunction = nullptr;
+        if (!s_IsSniperFunction)
+        {
+            s_IsSniperFunction = cameraManager->Class
+                ? cameraManager->Class->GetFunction("BP_PlayerCameraManager_C", "IsSniper")
+                : nullptr;
+        }
+
+        if (!s_IsSniperFunction)
+        {
+            return false;
+        }
+
+        struct IsSniperParams
+        {
+            bool bIsSniper = false;
+            bool bLocIsSniper = false;
+            uint8 ActiveCameraRig = 0;
+            bool bMatchesSniperRig = false;
+        };
+
+        IsSniperParams params{};
+        cameraManager->ProcessEvent(s_IsSniperFunction, &params);
+        return params.bIsSniper;
+    }
+
     static bool IsLocalSniperVisualizationActive(SDK::ABP_BaseTank_C* Tank)
     {
         return IsUsableTank(Tank) && (Tank->GetSniperToggle() || Tank->GetSniperZoom());
+    }
+
+    static bool IsLocalSniperVisualizationActive(
+        SDK::APlayerController* PlayerController,
+        SDK::ABP_BaseTank_C* Tank)
+    {
+        if (IsCameraManagerSniperActive(PlayerController))
+        {
+            return true;
+        }
+
+        return IsLocalSniperVisualizationActive(Tank);
     }
 
     static std::string BuildProjectileKey(SDK::ATyrProjectile* Projectile)
@@ -1047,7 +4324,7 @@ namespace
                 TArray<FHitResult> lineOfSightHits;
                 const bool bLineOfSightHit = UKismetSystemLibrary::LineTraceMulti(
                     World,
-                    FireOrigin,
+                    CameraLoc,
                     boneWorldLoc,
                     ETraceTypeQuery::TraceTypeQuery1,
                     false,
@@ -1059,19 +4336,24 @@ namespace
                     { 0, 0, 0, 0 },
                     0.0f);
 
-                const bool bIsBoneVisible = !bLineOfSightHit || TryGetFirstBlockingHitOwnedBy(lineOfSightHits, TargetTank);
-                if (!bIsBoneVisible)
+                FHitResult visibleSurfaceHit{};
+                if (!bLineOfSightHit ||
+                    !TryGetFirstBlockingHitOwnedBy(lineOfSightHits, TargetTank, &visibleSurfaceHit))
                 {
                     continue;
                 }
 
-                bHasVisibleSurface = true;
+                FVector visibleAimPoint{};
+                if (!TryResolveAimPointFromHit(visibleSurfaceHit, &visibleAimPoint))
+                {
+                    continue;
+                }
 
                 TArray<FHitResult> armorHitResults;
                 const bool bArmorHit = UKismetSystemLibrary::LineTraceMulti(
                     World,
                     FireOrigin,
-                    boneWorldLoc,
+                    visibleAimPoint,
                     ETraceTypeQuery::TraceTypeQuery1,
                     false,
                     actorsToIgnore,
@@ -1092,6 +4374,8 @@ namespace
                 {
                     continue;
                 }
+
+                bHasVisibleSurface = true;
 
                 FVector resolvedAimPoint{};
                 if (!TryResolveAimPointFromHit(armorHit, &resolvedAimPoint))
@@ -1183,6 +4467,132 @@ namespace
         ArmorComponent->SetArmorVisualization(false);
     }
 
+    static void ResetArmorVisualizationSetupState(ArmorVisualizationSetupState* SetupState)
+    {
+        if (!SetupState)
+        {
+            return;
+        }
+
+        SetupState->Tank = nullptr;
+        SetupState->TankKey = {};
+        SetupState->LastAttemptTick = 0;
+        SetupState->LastVisualizerRefreshTick = 0;
+        SetupState->IsVisualizationEnabled = false;
+        SetupState->LastRefreshWasForced = false;
+    }
+
+    static SDK::ABP_BaseTank_C* ResolveArmorVisualizationSetupTank(const ArmorVisualizationSetupState& SetupState)
+    {
+        if (auto* const trackedTank = ResolveTrackedObject<SDK::ABP_BaseTank_C>(SetupState.TankKey))
+        {
+            return trackedTank;
+        }
+
+        return IsUsableTank(SetupState.Tank) ? SetupState.Tank : nullptr;
+    }
+
+    static bool DoesArmorVisualizationSetupMatchTank(
+        const ArmorVisualizationSetupState& SetupState,
+        SDK::ABP_BaseTank_C* Tank)
+    {
+        if (!IsUsableTank(Tank))
+        {
+            return false;
+        }
+
+        const TrackedObjectKey tankKey = MakeTrackedObjectKey(Tank);
+        if (IsTrackedObjectKeyValid(SetupState.TankKey) &&
+            IsTrackedObjectKeyValid(tankKey))
+        {
+            return SetupState.TankKey == tankKey;
+        }
+
+        return SetupState.Tank == Tank;
+    }
+
+    static void CaptureArmorVisualizationSetupTank(
+        ArmorVisualizationSetupState* SetupState,
+        SDK::ABP_BaseTank_C* Tank)
+    {
+        if (!SetupState)
+        {
+            return;
+        }
+
+        SetupState->Tank = Tank;
+        SetupState->TankKey = MakeTrackedObjectKey(Tank);
+    }
+
+    static void DisableTrackedArmorVisualizationState(ArmorVisualizationSetupState* SetupState)
+    {
+        if (!SetupState)
+        {
+            return;
+        }
+
+        if (SetupState->IsVisualizationEnabled)
+        {
+            if (auto* const tank = ResolveArmorVisualizationSetupTank(*SetupState))
+            {
+                DisableArmorVisualizationComponent(tank->ArmorVisualizationComponent);
+                DisableArmorVisualizationComponent(tank->ArmorVisualizationComponentHull);
+                DisableArmorVisualizationComponent(tank->ArmorVisualizationComponentTurret);
+                tank->SetCustomArmorVisualization(false);
+                tank->SetOwnVertexArmorVisualizer(false);
+                tank->bIsSelfAmorVisualizing = false;
+                tank->UpdateArmorVisualizerSceneCaptureFilter();
+                tank->RefreshArmorVisualizer();
+            }
+        }
+
+        ResetArmorVisualizationSetupState(SetupState);
+    }
+
+    static void DisableTrackedArmorVisualizationForEntityKey(const std::string& EntityKey)
+    {
+        if (EntityKey.empty())
+        {
+            return;
+        }
+
+        const auto setupStateIt = g_ArmorVisualizationSetupCache.find(EntityKey);
+        if (setupStateIt == g_ArmorVisualizationSetupCache.end())
+        {
+            return;
+        }
+
+        DisableTrackedArmorVisualizationState(&setupStateIt->second);
+    }
+
+    static void ReconcileTrackedArmorVisualizationTargets(
+        const std::set<std::string>& ActiveEntityKeys)
+    {
+        for (auto it = g_ArmorVisualizationSetupCache.begin();
+             it != g_ArmorVisualizationSetupCache.end();)
+        {
+            const bool shouldRemainActive = ActiveEntityKeys.find(it->first) != ActiveEntityKeys.end();
+            if (shouldRemainActive)
+            {
+                ++it;
+                continue;
+            }
+
+            DisableTrackedArmorVisualizationState(&it->second);
+            it = g_ArmorVisualizationSetupCache.erase(it);
+        }
+    }
+
+    static void DisableAllTrackedArmorVisualization()
+    {
+        for (auto& cacheEntry : g_ArmorVisualizationSetupCache)
+        {
+            DisableTrackedArmorVisualizationState(&cacheEntry.second);
+        }
+
+        g_ArmorVisualizationSetupCache.clear();
+    }
+
     static void EnsureArmorVisualizationRenderTarget(const std::string& EntityKey, SDK::ABP_BaseTank_C* Tank)
     {
         if (EntityKey.empty() || !IsUsableTank(Tank))
@@ -1193,19 +4603,21 @@ namespace
         constexpr ULONGLONG ArmorVisualizationRetryMs = 1000;
         const ULONGLONG nowTick = GetTickCount64();
         auto& setupState = g_ArmorVisualizationSetupCache[EntityKey];
-        const bool tankChanged = setupState.Tank != Tank;
+        const bool tankChanged = !DoesArmorVisualizationSetupMatchTank(setupState, Tank);
         const bool missingDynamicMats = Tank->ArmorOverlayDynamicMats.Num() <= 0;
         const bool retryExpired = tankChanged || (nowTick >= setupState.LastAttemptTick && (nowTick - setupState.LastAttemptTick) >= ArmorVisualizationRetryMs);
 
         if (tankChanged || (missingDynamicMats && retryExpired))
         {
             Tank->SetupArmorVisualizerRenderTarget();
-            setupState.Tank = Tank;
+            CaptureArmorVisualizationSetupTank(&setupState, Tank);
             setupState.LastAttemptTick = nowTick;
         }
     }
 
-    static void RefreshLocalArmorVisualizationContext(SDK::ABP_BaseTank_C* Tank)
+    static void RefreshLocalArmorVisualizationContext(
+        SDK::APlayerController* PlayerController,
+        SDK::ABP_BaseTank_C* Tank)
     {
         if (!IsUsableTank(Tank))
         {
@@ -1213,35 +4625,129 @@ namespace
         }
 
         static ArmorVisualizationSetupState localSetupState{};
+        static SDK::UWorld* s_LastLocalArmorVisualizationWorld = nullptr;
+        static bool s_LastLocalSniperVisualizationActive = false;
         constexpr ULONGLONG ArmorVisualizationRetryMs = 1000;
+        const bool bSniperVisualizationActive = IsLocalSniperVisualizationActive(PlayerController, Tank);
+        SDK::UWorld* const world = GetWorld();
         const ULONGLONG nowTick = GetTickCount64();
-        const bool tankChanged = localSetupState.Tank != Tank;
+        const bool worldChanged = s_LastLocalArmorVisualizationWorld != world;
+        const bool tankChanged =
+            worldChanged ||
+            !DoesArmorVisualizationSetupMatchTank(localSetupState, Tank);
+        const bool sniperStateChanged =
+            worldChanged ||
+            s_LastLocalSniperVisualizationActive != bSniperVisualizationActive;
         const bool missingDynamicMats = Tank->ArmorOverlayDynamicMats.Num() <= 0;
-        const bool retryExpired = tankChanged || (nowTick >= localSetupState.LastAttemptTick && (nowTick - localSetupState.LastAttemptTick) >= ArmorVisualizationRetryMs);
+        const bool retryExpired =
+            localSetupState.LastAttemptTick == 0 ||
+            nowTick < localSetupState.LastAttemptTick ||
+            (nowTick - localSetupState.LastAttemptTick) >= ArmorVisualizationRetryMs;
 
-        if (tankChanged || (missingDynamicMats && retryExpired))
+        auto resetLocalTankVisualizationState = [](SDK::ABP_BaseTank_C* LocalTank)
+        {
+            if (!IsUsableTank(LocalTank))
+            {
+                return;
+            }
+
+            DisableArmorVisualizationComponent(LocalTank->ArmorVisualizationComponent);
+            DisableArmorVisualizationComponent(LocalTank->ArmorVisualizationComponentHull);
+            DisableArmorVisualizationComponent(LocalTank->ArmorVisualizationComponentTurret);
+            LocalTank->SetCustomArmorVisualization(false);
+            LocalTank->SetOwnVertexArmorVisualizer(false);
+            LocalTank->bIsSelfAmorVisualizing = false;
+            LocalTank->Set_Self_Shader(false, false);
+            LocalTank->TurnOffOutlineForSelf();
+            LocalTank->UpdateArmorVisualizerSceneCaptureFilter();
+            LocalTank->UpdateArmorVisualizationMPCValues();
+            LocalTank->RefreshArmorVisualizer();
+        };
+
+        if (tankChanged)
+        {
+            if (auto* const previousTank = ResolveArmorVisualizationSetupTank(localSetupState))
+            {
+                if (previousTank != Tank)
+                {
+                    resetLocalTankVisualizationState(previousTank);
+                }
+            }
+
+            ResetArmorVisualizationSetupState(&localSetupState);
+        }
+
+        if (tankChanged || sniperStateChanged || (missingDynamicMats && retryExpired))
         {
             Tank->SetupArmorVisualizerRenderTarget();
-            localSetupState.Tank = Tank;
+            CaptureArmorVisualizationSetupTank(&localSetupState, Tank);
             localSetupState.LastAttemptTick = nowTick;
         }
 
-        Tank->bIsSelfAmorVisualizing = IsLocalSniperVisualizationActive(Tank);
+        DisableArmorVisualizationComponent(Tank->ArmorVisualizationComponent);
+        DisableArmorVisualizationComponent(Tank->ArmorVisualizationComponentHull);
+        DisableArmorVisualizationComponent(Tank->ArmorVisualizationComponentTurret);
+        Tank->SetCustomArmorVisualization(false);
+        Tank->SetOwnVertexArmorVisualizer(false);
+        Tank->bIsSelfAmorVisualizing = false;
+        Tank->Set_Self_Shader(false, false);
+        Tank->TurnOffOutlineForSelf();
         Tank->UpdateArmorVisualizerSceneCaptureFilter();
         Tank->UpdateArmorVisualizationMPCValues();
+
+        if (tankChanged || sniperStateChanged)
+        {
+            Tank->RefreshArmorVisualizer();
+        }
+
+        s_LastLocalArmorVisualizationWorld = world;
+        s_LastLocalSniperVisualizationActive = bSniperVisualizationActive;
     }
 
-    static void ForceAlwaysOnEnemyArmorVisualization(
+    static void DisableAlwaysOnEnemyArmorVisualization(SDK::ABP_BaseTank_C* Tank);
+
+    static void PrepareEnemyArmorVisualizationForSdkPath(
         const std::string& EntityKey,
         SDK::ABP_BaseTank_C* Tank,
-        SDK::ABP_BaseTank_C* LocalTank)
+        bool bRefreshArmorVisualizer)
     {
         if (EntityKey.empty() || !IsUsableTank(Tank))
         {
             return;
         }
 
+        const ULONGLONG nowTick = GetTickCount64();
+        auto& setupState = g_ArmorVisualizationSetupCache[EntityKey];
+        const bool tankChanged = !DoesArmorVisualizationSetupMatchTank(setupState, Tank);
+        const bool visualizationModeChanged =
+            setupState.IsVisualizationEnabled &&
+            setupState.LastRefreshWasForced != bRefreshArmorVisualizer;
+        if (tankChanged || visualizationModeChanged)
+        {
+            DisableTrackedArmorVisualizationState(&setupState);
+        }
+
         EnsureArmorVisualizationRenderTarget(EntityKey, Tank);
+
+        const bool alreadyPreparedForRequestedMode =
+            DoesArmorVisualizationSetupMatchTank(setupState, Tank) &&
+            setupState.IsVisualizationEnabled &&
+            setupState.LastRefreshWasForced == bRefreshArmorVisualizer;
+        if (alreadyPreparedForRequestedMode)
+        {
+            constexpr ULONGLONG ArmorVisualizerRefreshMs = 100;
+            const bool refreshExpired =
+                setupState.LastVisualizerRefreshTick == 0 ||
+                nowTick < setupState.LastVisualizerRefreshTick ||
+                (nowTick - setupState.LastVisualizerRefreshTick) >= ArmorVisualizerRefreshMs;
+            if (bRefreshArmorVisualizer && refreshExpired)
+            {
+                Tank->RefreshArmorVisualizer();
+                setupState.LastVisualizerRefreshTick = nowTick;
+            }
+            return;
+        }
+
         EnableArmorVisualizationComponent(Tank->ArmorVisualizationComponent);
         EnableArmorVisualizationComponent(Tank->ArmorVisualizationComponentHull);
         EnableArmorVisualizationComponent(Tank->ArmorVisualizationComponentTurret);
@@ -1249,26 +4755,34 @@ namespace
         Tank->SetOwnVertexArmorVisualizer(false);
         Tank->bIsSelfAmorVisualizing = true;
         Tank->UpdateArmorVisualizerSceneCaptureFilter();
-        (void)LocalTank;
+        const bool shouldRefreshNow =
+            bRefreshArmorVisualizer &&
+            (!setupState.IsVisualizationEnabled ||
+             setupState.LastRefreshWasForced != bRefreshArmorVisualizer ||
+             tankChanged);
+        if (shouldRefreshNow)
+        {
+            Tank->RefreshArmorVisualizer();
+            setupState.LastVisualizerRefreshTick = nowTick;
+        }
+
+        CaptureArmorVisualizationSetupTank(&setupState, Tank);
+        setupState.IsVisualizationEnabled = true;
+        setupState.LastRefreshWasForced = bRefreshArmorVisualizer;
     }
 
     static void PrepareEnemyArmorVisualizationForNativeSniper(
         const std::string& EntityKey,
         SDK::ABP_BaseTank_C* Tank)
     {
-        if (EntityKey.empty() || !IsUsableTank(Tank))
-        {
-            return;
-        }
+        PrepareEnemyArmorVisualizationForSdkPath(EntityKey, Tank, false);
+    }
 
-        EnsureArmorVisualizationRenderTarget(EntityKey, Tank);
-        EnableArmorVisualizationComponent(Tank->ArmorVisualizationComponent);
-        EnableArmorVisualizationComponent(Tank->ArmorVisualizationComponentHull);
-        EnableArmorVisualizationComponent(Tank->ArmorVisualizationComponentTurret);
-        Tank->bIsSelfAmorVisualizing = true;
-        Tank->SetCustomArmorVisualization(false);
-        Tank->SetOwnVertexArmorVisualizer(false);
-        Tank->UpdateArmorVisualizerSceneCaptureFilter();
+    static void ForceAlwaysOnEnemyArmorVisualization(
+        const std::string& EntityKey,
+        SDK::ABP_BaseTank_C* Tank)
+    {
+        PrepareEnemyArmorVisualizationForSdkPath(EntityKey, Tank, true);
     }
 
     static void DisableAlwaysOnEnemyArmorVisualization(SDK::ABP_BaseTank_C* Tank)
@@ -1278,12 +4792,59 @@ namespace
             return;
         }
 
-        DisableArmorVisualizationComponent(Tank->ArmorVisualizationComponent);
-        DisableArmorVisualizationComponent(Tank->ArmorVisualizationComponentHull);
-        DisableArmorVisualizationComponent(Tank->ArmorVisualizationComponentTurret);
-        Tank->SetCustomArmorVisualization(false);
-        Tank->SetOwnVertexArmorVisualizer(false);
-        Tank->bIsSelfAmorVisualizing = false;
+        ArmorVisualizationSetupState* matchingState = nullptr;
+        for (auto& cacheEntry : g_ArmorVisualizationSetupCache)
+        {
+            if (DoesArmorVisualizationSetupMatchTank(cacheEntry.second, Tank))
+            {
+                matchingState = &cacheEntry.second;
+                break;
+            }
+        }
+
+        const bool wasEnabled = matchingState && matchingState->IsVisualizationEnabled;
+        if (!wasEnabled)
+        {
+            return;
+        }
+
+        DisableTrackedArmorVisualizationState(matchingState);
+    }
+
+    static void DisableEnemyArmorVisualizationAcrossWorld(
+        SDK::UWorld* World,
+        SDK::ABP_BaseTank_C* SelfTank)
+    {
+        if (!World)
+        {
+            return;
+        }
+
+        std::vector<SDK::ULevel*> levels;
+        CollectWorldLevels(World, &levels);
+        for (SDK::ULevel* Level : levels)
+        {
+            if (!Level || !ISVALID(Level))
+            {
+                continue;
+            }
+
+            for (SDK::AActor* Actor : Level->Actors)
+            {
+                if (!Actor || !ISVALID(Actor) || !Actor->IsA(SDK::ABP_BaseTank_C::StaticClass()))
+                {
+                    continue;
+                }
+
+                auto* const tank = static_cast<SDK::ABP_BaseTank_C*>(Actor);
+                if (!IsUsableTank(tank) || tank == SelfTank)
+                {
+                    continue;
+                }
+
+                DisableAlwaysOnEnemyArmorVisualization(tank);
+            }
+        }
     }
 
     static void RefreshEnemyShellFireMarker(
@@ -1346,27 +4907,14 @@ namespace
         UpdateEnemyShellFireMarkerFromLocation(EntityKey, VehicleName, fireOrigin);
     }
 
-    static void RefreshTrackedEntityLastKnownLocation(
-        const std::string& EntityKey,
-        const std::wstring& VehicleName,
-        const SDK::FVector& RootWorld,
-        const SDK::FVector& HeadWorld)
+    static void DrawLastKnownEntity(UCanvas* Canvas, APlayerController* PlayerController, const SDK::FVector& SelfLocation, const LastSeenEntityInfo& CachedInfo)
     {
-        const auto it = g_LastSeenEntityCache.find(EntityKey);
-        if (it == g_LastSeenEntityCache.end())
+        if (!Canvas || !PlayerController || !CachedInfo.HasLastKnownPosition)
         {
             return;
         }
 
-        it->second.LastRootWorld = RootWorld;
-        it->second.LastHeadWorld = HeadWorld;
-        it->second.VehicleName = VehicleName;
-        it->second.HasLastKnownPosition = true;
-    }
-
-    static void DrawLastKnownEntity(UCanvas* Canvas, APlayerController* PlayerController, const SDK::FVector& SelfLocation, const LastSeenEntityInfo& CachedInfo)
-    {
-        if (!Canvas || !PlayerController || !CachedInfo.HasLastKnownPosition)
+        if (IsBeyondSceneDrawDistance(SelfLocation, CachedInfo.LastRootWorld))
         {
             return;
         }
@@ -2234,44 +5782,6 @@ namespace
 
 
 
-// Function definitions
-static void DebugPrintf(const char* fmt, ...)
-{
-    char buffer[1024];
-    char final_buffer[1024];
-
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-
-    snprintf(final_buffer, sizeof(final_buffer), "[Empire] %s", buffer);
-    OutputDebugStringA(final_buffer);
-}
-
-static void SecureZeroMemoryCustom(void* pDest, size_t nSize)
-{
-    unsigned char* p = (unsigned char*)pDest;
-    for (size_t i = 0; i < nSize; i++)
-    {
-        p[i] = 0;
-    }
-}
-
-static void dbgprint(const char* string, ...)
-{
-    char buf[512];
-    va_list arg_list;
-
-    SecureZeroMemoryCustom(buf, sizeof(buf));
-
-    va_start(arg_list, string);
-    vsnprintf(buf, sizeof(buf), string, arg_list);
-    va_end(arg_list);
-
-    OutputDebugStringA(buf);
-}
-
 UWorld* GetWorld()
 {
     return UWorld::GetWorld();
@@ -2353,6 +5863,366 @@ static void DrawTextSafe(
         return;
 
     Canvas->K2_DrawText(Roboto, Text, ScreenPosition, Scale, Color, Kerning, ShadowColor, ShadowOffset, bCentreX, bCentreY, bOutlined, OutlineColor);
+}
+
+static void DrawTrackedTargetPredictionCircle(
+    SDK::UCanvas* Canvas,
+    SDK::APlayerController* PlayerController,
+    SDK::UWorld* World,
+    SDK::ABP_BaseTank_C* SelfTank,
+    SDK::ATyrPlayerStateBase* SelfState,
+    const std::string& EntityKey,
+    SDK::ABP_BaseTank_C* TargetTank,
+    const SDK::FVector& AimReferenceWorld)
+{
+    if (!Canvas ||
+        !PlayerController ||
+        !World ||
+        !IsUsableTank(SelfTank) ||
+        !IsUsableTank(TargetTank) ||
+        AimReferenceWorld.IsZero())
+    {
+        return;
+    }
+
+    float shellSpeed = 0.0f;
+    float gravityZ = -980.0f;
+    if (!TryGetCurrentShellBallistics(World, SelfTank, SelfState, &shellSpeed, &gravityZ))
+    {
+        return;
+    }
+
+    const SDK::FVector fireOrigin = GetEstimatedTankFireOrigin(SelfTank);
+    if (fireOrigin.IsZero())
+    {
+        return;
+    }
+
+    const SDK::FVector predictedAimWorld = PredictBallisticLeadPoint(
+        fireOrigin,
+        AimReferenceWorld,
+        TargetTank->GetVelocity(),
+        shellSpeed,
+        gravityZ);
+
+    SDK::FVector2D predictedAimScreen{};
+    if (!PlayerController->ProjectWorldLocationToScreen(predictedAimWorld, &predictedAimScreen, true))
+    {
+        return;
+    }
+
+    const SDK::FLinearColor indicatorColor = ResolveTrackedEntityIndicatorColor(EntityKey);
+    DrawCircle(predictedAimScreen, 6.0f, 20, indicatorColor, nullptr, Canvas);
+}
+
+static bool IsUsableCaptureZone(SDK::ATyrCaptureZone* Zone)
+{
+    return Zone && ISVALID(Zone) && !Zone->IsActorBeingDestroyed();
+}
+
+static bool TryBuildTeamCaptureVictoryEstimate(
+    SDK::UWorld* World,
+    SDK::ATyrCaptureZone* Zone,
+    TeamCaptureVictoryEstimate* OutEstimate)
+{
+    if (!World || !IsUsableCaptureZone(Zone) || !OutEstimate)
+    {
+        return false;
+    }
+
+    *OutEstimate = TeamCaptureVictoryEstimate{};
+    const int32 ownerTeamId = Zone->PubTeamID;
+    const int32 attackingTeamId = SDK::UTyrTeamStatics::GetOpposingTeam(World, ownerTeamId, false);
+    if (attackingTeamId == ownerTeamId)
+    {
+        return false;
+    }
+
+    const int32 attackers = Zone->NumEnemies > 0 ? Zone->NumEnemies : 0;
+    const int32 defenders = Zone->NumAllies > 0 ? Zone->NumAllies : 0;
+    const int32 captureMaxTotal = Zone->CaptureMaxTotal > 0 ? Zone->CaptureMaxTotal : 0;
+    int32 captureProgress = Zone->CapturePoints;
+    if (captureProgress < 0)
+    {
+        captureProgress = 0;
+    }
+    if (captureProgress > captureMaxTotal)
+    {
+        captureProgress = captureMaxTotal;
+    }
+    const int32 remainingCapture = (captureMaxTotal - captureProgress) > 0 ? (captureMaxTotal - captureProgress) : 0;
+    const int32 captureUnitCap = Zone->CaptureUnitCap > 0 ? Zone->CaptureUnitCap : attackers;
+    int32 effectiveAttackers = attackers;
+    if (effectiveAttackers < 0)
+    {
+        effectiveAttackers = 0;
+    }
+    if (effectiveAttackers > captureUnitCap)
+    {
+        effectiveAttackers = captureUnitCap;
+    }
+    const double capturePointsPerSecond = Zone->CapturePointsPerSecond > 0 ? static_cast<double>(Zone->CapturePointsPerSecond) : 0.0;
+    const double estimatedCaptureRate = capturePointsPerSecond * static_cast<double>(effectiveAttackers);
+    const bool isContested = attackers > 0 && defenders > 0;
+    const bool hasPositiveCaptureRate = attackers > 0 && !isContested && remainingCapture > 0 && estimatedCaptureRate > 0.0;
+
+    OutEstimate->TeamId = attackingTeamId;
+    OutEstimate->EnemyPointOwnerTeamId = ownerTeamId;
+    OutEstimate->TanksOnEnemyPoint = attackers;
+    OutEstimate->DefendersOnEnemyPoint = defenders;
+    OutEstimate->CaptureProgress = captureProgress;
+    OutEstimate->CaptureMaxTotal = captureMaxTotal;
+    OutEstimate->CapturePointsPerSecond = Zone->CapturePointsPerSecond;
+    OutEstimate->CaptureUnitCap = Zone->CaptureUnitCap;
+    OutEstimate->EstimatedSecondsUntilVictory = hasPositiveCaptureRate
+        ? static_cast<double>(remainingCapture) / estimatedCaptureRate
+        : 0.0;
+    OutEstimate->HasZone = true;
+    OutEstimate->HasAttackers = attackers > 0;
+    OutEstimate->IsContested = isContested;
+    OutEstimate->HasPositiveCaptureRate = hasPositiveCaptureRate;
+    return true;
+}
+
+static bool ShouldPreferCaptureVictoryEstimate(
+    const TeamCaptureVictoryEstimate& Candidate,
+    const TeamCaptureVictoryEstimate& Current)
+{
+    if (!Candidate.HasZone)
+    {
+        return false;
+    }
+
+    if (!Current.HasZone)
+    {
+        return true;
+    }
+
+    if (Candidate.HasAttackers != Current.HasAttackers)
+    {
+        return Candidate.HasAttackers;
+    }
+
+    if (Candidate.HasPositiveCaptureRate != Current.HasPositiveCaptureRate)
+    {
+        return Candidate.HasPositiveCaptureRate;
+    }
+
+    if (Candidate.HasPositiveCaptureRate && Current.HasPositiveCaptureRate)
+    {
+        if (Candidate.EstimatedSecondsUntilVictory != Current.EstimatedSecondsUntilVictory)
+        {
+            return Candidate.EstimatedSecondsUntilVictory < Current.EstimatedSecondsUntilVictory;
+        }
+    }
+
+    if (Candidate.TanksOnEnemyPoint != Current.TanksOnEnemyPoint)
+    {
+        return Candidate.TanksOnEnemyPoint > Current.TanksOnEnemyPoint;
+    }
+
+    if (Candidate.CaptureProgress != Current.CaptureProgress)
+    {
+        return Candidate.CaptureProgress > Current.CaptureProgress;
+    }
+
+    return Candidate.CaptureMaxTotal > Current.CaptureMaxTotal;
+}
+
+static std::wstring BuildTeamCaptureVictoryText(const TeamCaptureVictoryEstimate& Estimate)
+{
+    const std::wstring teamLabel = Estimate.TeamId != 0
+        ? (L"Team " + std::to_wstring(Estimate.TeamId))
+        : L"Team ?";
+
+    std::wstring etaLabel = L"N/A";
+    if (Estimate.HasAttackers)
+    {
+        if (Estimate.HasPositiveCaptureRate)
+        {
+            const double boundedSeconds = Estimate.EstimatedSecondsUntilVictory > 0.0 ? Estimate.EstimatedSecondsUntilVictory : 0.0;
+            const int32 secondsUntilVictory = static_cast<int32>(std::ceil(boundedSeconds));
+            etaLabel = std::to_wstring(secondsUntilVictory) + L" Seconds";
+        }
+        else if (Estimate.IsContested)
+        {
+            etaLabel = L"Contested";
+        }
+        else if (Estimate.CaptureMaxTotal > 0 && Estimate.CaptureProgress >= Estimate.CaptureMaxTotal)
+        {
+            etaLabel = L"0 Seconds";
+        }
+    }
+
+    return teamLabel +
+        L" - Time Until Victory " + etaLabel +
+        L" - Num of Tanks " + std::to_wstring(Estimate.TanksOnEnemyPoint > 0 ? Estimate.TanksOnEnemyPoint : 0);
+}
+
+static void RefreshTrackedEntityReloadInfo(
+    const std::string& EntityKey,
+    SDK::UWorld* World,
+    SDK::ABP_BaseTank_C* Tank)
+{
+    if (EntityKey.empty() || !World || !IsUsableTank(Tank) || !IsUsableObject(Tank->ShellFiringComponent))
+    {
+        return;
+    }
+
+    auto* const shellFiringComponent = Tank->ShellFiringComponent;
+    auto& reloadInfo = g_TrackedEntityReloadCache[EntityKey];
+
+    double totalReloadTime = shellFiringComponent->ReloadTime > 0.05
+        ? static_cast<double>(shellFiringComponent->ReloadTime)
+        : shellFiringComponent->TimeBetweenShells;
+    if (totalReloadTime < 0.0)
+    {
+        totalReloadTime = 0.0;
+    }
+
+    double remainingReloadTime = shellFiringComponent->RemainingReloadTime;
+    if (remainingReloadTime < 0.0)
+    {
+        remainingReloadTime = 0.0;
+    }
+
+    const double currentTimeSeconds = SDK::UGameplayStatics::GetTimeSeconds(World);
+    const double lastFireTime = shellFiringComponent->LastFireTime;
+    if (remainingReloadTime <= 0.05 && totalReloadTime > 0.05 && currentTimeSeconds >= lastFireTime)
+    {
+        const double elapsedSinceFire = currentTimeSeconds - lastFireTime;
+        const double derivedRemainingReloadTime = totalReloadTime - elapsedSinceFire;
+        if (derivedRemainingReloadTime > 0.05)
+        {
+            remainingReloadTime = derivedRemainingReloadTime;
+        }
+    }
+
+    reloadInfo.RemainingReloadTime = remainingReloadTime;
+    reloadInfo.TotalReloadTime = totalReloadTime;
+    reloadInfo.LastFireTime = lastFireTime;
+    reloadInfo.LastRefreshTick = GetTickCount64();
+    reloadInfo.IsLikelyReloading = remainingReloadTime > 0.05;
+    reloadInfo.HasData = totalReloadTime > 0.05 || lastFireTime > 0.0;
+}
+
+static TrackedEntityReloadDisplay BuildTrackedEntityReloadDisplay(const std::string& EntityKey)
+{
+    TrackedEntityReloadDisplay display{};
+    const auto reloadIt = g_TrackedEntityReloadCache.find(EntityKey);
+    if (reloadIt == g_TrackedEntityReloadCache.end() || !reloadIt->second.HasData)
+    {
+        return display;
+    }
+
+    const TrackedEntityReloadInfo& reloadInfo = reloadIt->second;
+    if (reloadInfo.IsLikelyReloading)
+    {
+        double nearReadyThreshold = 0.75;
+        if (reloadInfo.TotalReloadTime > 0.05)
+        {
+            const double scaledThreshold = reloadInfo.TotalReloadTime * 0.18;
+            if (scaledThreshold > nearReadyThreshold)
+            {
+                nearReadyThreshold = scaledThreshold;
+            }
+        }
+
+        wchar_t reloadBuffer[64]{};
+        if (reloadInfo.RemainingReloadTime <= nearReadyThreshold)
+        {
+            swprintf(reloadBuffer, 64, L"[near ready %.1fs]", reloadInfo.RemainingReloadTime);
+            display.Color = SDK::FLinearColor{ 1.0f, 1.0f, 0.0f, 1.0f };
+        }
+        else
+        {
+            swprintf(reloadBuffer, 64, L"[reloading %.1fs]", reloadInfo.RemainingReloadTime);
+            display.Color = SDK::FLinearColor{ 1.0f, 0.2f, 0.2f, 1.0f };
+        }
+
+        display.Text = reloadBuffer;
+        display.HasDisplay = true;
+        return display;
+    }
+
+    display.Text = L"[ready]";
+    display.Color = SDK::FLinearColor{ 0.1f, 1.0f, 0.1f, 1.0f };
+    display.HasDisplay = true;
+    return display;
+}
+
+static void DrawCaptureVictoryOverlay(
+    SDK::UCanvas* Canvas,
+    SDK::UWorld* World,
+    SDK::ATyrPlayerStateBase* SelfState,
+    const std::vector<SDK::ATyrCaptureZone*>& CaptureZones)
+{
+    if (!Canvas || !World || !IsUsableObject(SelfState) || CaptureZones.empty())
+    {
+        return;
+    }
+
+    const int32 selfTeamId = SelfState->GetTeamId();
+    const int32 opposingTeamId = SDK::UTyrTeamStatics::GetOpposingTeam(World, selfTeamId, false);
+
+    TeamCaptureVictoryEstimate selfEstimate{};
+    selfEstimate.TeamId = selfTeamId;
+
+    TeamCaptureVictoryEstimate enemyEstimate{};
+    enemyEstimate.TeamId = opposingTeamId;
+
+    bool hasAnyActiveAttack = false;
+    for (SDK::ATyrCaptureZone* Zone : CaptureZones)
+    {
+        TeamCaptureVictoryEstimate candidate{};
+        if (!TryBuildTeamCaptureVictoryEstimate(World, Zone, &candidate) || !candidate.HasAttackers)
+        {
+            continue;
+        }
+
+        hasAnyActiveAttack = true;
+        if (candidate.TeamId == selfTeamId)
+        {
+            if (ShouldPreferCaptureVictoryEstimate(candidate, selfEstimate))
+            {
+                selfEstimate = candidate;
+            }
+        }
+        else
+        {
+            if (opposingTeamId == candidate.TeamId || enemyEstimate.TeamId == 0 || enemyEstimate.TeamId == opposingTeamId)
+            {
+                if (ShouldPreferCaptureVictoryEstimate(candidate, enemyEstimate))
+                {
+                    enemyEstimate = candidate;
+                }
+            }
+        }
+    }
+
+    if (!hasAnyActiveAttack)
+    {
+        return;
+    }
+
+    const std::wstring overlayText =
+        BuildTeamCaptureVictoryText(selfEstimate) +
+        L"     |     " +
+        BuildTeamCaptureVictoryText(enemyEstimate);
+
+    DrawTextSafe(
+        Canvas,
+        FString(overlayText.c_str()),
+        FVector2D(Canvas->ClipX * 0.5f, 26.0f),
+        FVector2D(0.9f, 0.9f),
+        GetNeutralOverlayColor(),
+        0.0f,
+        FLinearColor{ 0.f, 0.f, 0.f, 1.f },
+        FVector2D(1.0f, 1.0f),
+        true,
+        false,
+        true,
+        FLinearColor{ 0.f, 0.f, 0.f, 0.85f });
 }
 
 bool IsValidScreenLoc(const FVector2D& Loc)
@@ -2507,138 +6377,177 @@ void DrawPlayerBounds(UCanvas* Canvas, APlayerController* PlayerController, SDK:
 
 
 
-void DumpDataTablesAsRaw()
+static bool IsNearDoubleValue(double Left, double Right)
 {
-    std::ofstream OutFile("datatables.txt");
-    if (!OutFile.is_open())
+    return std::fabs(Left - Right) <= 0.001;
+}
+
+static bool IsNearFloatValue(float Left, float Right)
+{
+    return std::fabs(Left - Right) <= 0.001f;
+}
+
+static void ClearTurretModState()
+{
+    g_TurretModState = {};
+}
+
+static void ClearWeaponModState()
+{
+    g_WeaponModState = {};
+}
+
+static void RestoreTurretMods()
+{
+    if (!g_TurretModState.HasSnapshot)
     {
-        DebugPrintf("Failed to open datatables.txt for writing.");
+        ClearTurretModState();
         return;
     }
 
-    DebugPrintf("Starting data table dump...");
-
-    for (int i = 0; i < SDK::UObject::GObjects->Num(); ++i)
+    if (auto* const turret = ResolveTrackedObject<SDK::UBPC_TurretBaseComponent_C>(g_TurretModState.TurretKey))
     {
-        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-        if (!Obj || !Obj->IsA(SDK::UDataTable::StaticClass()))
+        if (g_TurretModState.IsApplied)
         {
-            continue;
-        }
-
-        auto DataTable = static_cast<SDK::UDataTable*>(Obj);
-        if (!DataTable->RowStruct)
-        {
-            continue;
-        }
-
-        OutFile << "========================================================\n";
-        OutFile << "Data Table: " << DataTable->GetName() << "\n";
-        OutFile << "========================================================\n\n";
-        DebugPrintf("Dumping Table: %s", DataTable->GetName().c_str());
-
-        SDK::TArray<SDK::FName> RowNames;
-        SDK::UDataTableFunctionLibrary::GetDataTableRowNames(DataTable, &RowNames);
-
-        for (const auto& RowName : RowNames)
-        {
-            OutFile << "  Row: " << RowName.ToString() << "\n";
-            DebugPrintf("  Row: %s", RowName.ToString().c_str());
-
-            void* RowData = malloc(DataTable->RowStruct->Size); // Corrected to use ->Size
-            if (SDK::UDataTableFunctionLibrary::GetDataTableRowFromName(DataTable, RowName, (SDK::FTableRowBase*)RowData))
-            {
-                DebugPrintf("    Successfully got row data. Entering property loop...");
-                for (SDK::FField* Field = DataTable->RowStruct->ChildProperties; Field; Field = Field->Next)
-                {
-                    SDK::FProperty* Prop = (SDK::FProperty*)Field;
-                    if (!Prop) continue;
-
-                    std::string valueStr = "<RAW_HEX_DUMP_FAILED>";
-
-                    DebugPrintf("      Prop: %s, Size: %d, Offset: %d", Prop->Name.GetRawString().c_str(), Prop->ElementSize, Prop->Offset);
-                    void* PropertyValue = (char*)RowData + Prop->Offset;
-
-                    // Always dump raw bytes as hex string
-                    if (Prop->ElementSize > 0) {
-                        char* hex_buffer = (char*)malloc(Prop->ElementSize * 2 + 1);
-                        if (hex_buffer) {
-                            for (int k = 0; k < Prop->ElementSize; ++k) {
-                                sprintf(&hex_buffer[k * 2], "%02X", ((uint8*)PropertyValue)[k]);
-                            }
-                            hex_buffer[Prop->ElementSize * 2] = '\0';
-                            valueStr = std::string(hex_buffer) + " (Raw Bytes)";
-                            free(hex_buffer);
-                        }
-                        else {
-                            valueStr = "<RAW_HEX_DUMP_ALLOC_FAILED>";
-                        }
-                    }
-                    else {
-                        valueStr = "<RAW_HEX_DUMP_EMPTY_SIZE>";
-                    }
-
-                    OutFile << "    " << Prop->Name.GetRawString() << ": " << valueStr << "\n";
-                }
-                DebugPrintf("    ...Finished property loop.");
-            }
-            else
-            {
-                DebugPrintf("    Failed to get row data for %s", RowName.ToString().c_str());
-            }
-            free(RowData);
-            OutFile << "\n";
+            turret->MaxTurretRotation = g_TurretModState.OriginalMaxTurretRotation;
+            turret->RotationSensitivity = g_TurretModState.OriginalRotationSensitivity;
         }
     }
 
-    OutFile.close();
-    DebugPrintf("Finished dumping data tables to datatables.txt");
+    ClearTurretModState();
+}
+
+static void RestoreWeaponMods()
+{
+    if (!g_WeaponModState.HasSnapshot)
+    {
+        ClearWeaponModState();
+        return;
+    }
+
+    if (auto* const shellComp =
+            ResolveTrackedObject<SDK::UBPC_ShellFiringComponent_C>(g_WeaponModState.ShellComponentKey))
+    {
+        if (g_WeaponModState.IsApplied)
+        {
+            shellComp->RecoilTorque = g_WeaponModState.OriginalRecoilTorque;
+            shellComp->BaseGunRecoilTorque = g_WeaponModState.OriginalBaseGunRecoilTorque;
+            shellComp->GunRecoilAlpha = g_WeaponModState.OriginalGunRecoilAlpha;
+            shellComp->DispersionInterpSpeed = g_WeaponModState.OriginalDispersionInterpSpeed;
+            shellComp->bIsPreciseDispersion = g_WeaponModState.OriginalIsPreciseDispersion;
+            shellComp->PreciseDispersionFactor = g_WeaponModState.OriginalPreciseDispersionFactor;
+            shellComp->PreciseDispersionDegrees = g_WeaponModState.OriginalPreciseDispersionDegrees;
+        }
+    }
+
+    ClearWeaponModState();
+}
+
+static void RestoreAllLocalVehicleModState()
+{
+    RestoreTurretMods();
+    RestoreWeaponMods();
+}
+
+static void RefreshLocalVehicleModLifecycle(SDK::UWorld* World)
+{
+    if (!World)
+    {
+        RestoreAllLocalVehicleModState();
+        g_LastLocalVehicleModWorld = nullptr;
+        return;
+    }
+
+    if (g_LastLocalVehicleModWorld != World)
+    {
+        RestoreAllLocalVehicleModState();
+    }
+
+    g_LastLocalVehicleModWorld = World;
 }
 
 void ApplyTurretMods(SDK::UBPC_TurretBaseComponent_C* Turret)
 {
-    if (!Turret || !ISVALID(Turret))
+    const bool enableTurretMods = EmpireFeatures::Get(EmpireFeatures::TurretMods);
+    if (!IsUsableObject(Turret) || !enableTurretMods)
     {
+        RestoreTurretMods();
         return;
     }
 
-    if (!g_TurretModState.HasSnapshot || g_TurretModState.Turret != Turret)
+    const TrackedObjectKey turretKey = MakeTrackedObjectKey(Turret);
+    if (!IsTrackedObjectKeyValid(turretKey))
     {
-        g_TurretModState.Turret = Turret;
+        RestoreTurretMods();
+        return;
+    }
+
+    const bool turretChanged =
+        !g_TurretModState.HasSnapshot ||
+        !IsTrackedObjectKeyValid(g_TurretModState.TurretKey) ||
+        !(g_TurretModState.TurretKey == turretKey);
+    if (turretChanged)
+    {
+        RestoreTurretMods();
+        g_TurretModState.TurretKey = turretKey;
         g_TurretModState.OriginalMaxTurretRotation = Turret->MaxTurretRotation;
         g_TurretModState.OriginalRotationSensitivity = Turret->RotationSensitivity;
         g_TurretModState.HasSnapshot = true;
     }
 
-    if (EmpireFeatures::Get(EmpireFeatures::TurretMods))
+    constexpr double DesiredMaxTurretRotation = 999999.0;
+    constexpr double DesiredRotationSensitivity = 100.0;
+    if (g_TurretModState.HasSnapshot && g_TurretModState.IsApplied)
     {
-        Turret->MaxTurretRotation = 999999.0;
-        Turret->RotationSensitivity = 100.0;
-        Turret->bAtTurretLimit = false;
-        g_TurretModState.WasAppliedLastFrame = true;
-        return;
+        if (!IsNearDoubleValue(Turret->MaxTurretRotation, DesiredMaxTurretRotation))
+        {
+            g_TurretModState.OriginalMaxTurretRotation = Turret->MaxTurretRotation;
+        }
+
+        if (!IsNearDoubleValue(Turret->RotationSensitivity, DesiredRotationSensitivity))
+        {
+            g_TurretModState.OriginalRotationSensitivity = Turret->RotationSensitivity;
+        }
     }
 
-    if (g_TurretModState.WasAppliedLastFrame && g_TurretModState.Turret == Turret)
-    {
-        Turret->MaxTurretRotation = g_TurretModState.OriginalMaxTurretRotation;
-        Turret->RotationSensitivity = g_TurretModState.OriginalRotationSensitivity;
-        g_TurretModState.WasAppliedLastFrame = false;
-    }
+    Turret->MaxTurretRotation = DesiredMaxTurretRotation;
+    Turret->RotationSensitivity = DesiredRotationSensitivity;
+    Turret->bAtTurretLimit = false;
+    g_TurretModState.IsApplied = true;
 }
 
 void ApplyWeaponMods()
 {
-    auto self = GetSelf();
-    if (!IsUsableTank(self)) return;
-
-    // 1. Access the Shell Firing Component
-    SDK::UBPC_ShellFiringComponent_C* ShellComp = self->ShellFiringComponent;
-    if (!ShellComp || !ISVALID(ShellComp)) return;
-
-    if (!g_WeaponModState.HasSnapshot || g_WeaponModState.ShellComponent != ShellComp)
+    const bool enableWeaponMods = EmpireFeatures::Get(EmpireFeatures::WeaponMods);
+    auto* const self = GetSelf();
+    if (!enableWeaponMods || !IsUsableTank(self))
     {
-        g_WeaponModState.ShellComponent = ShellComp;
+        RestoreWeaponMods();
+        return;
+    }
+
+    SDK::UBPC_ShellFiringComponent_C* const ShellComp = self->ShellFiringComponent;
+    if (!IsUsableObject(ShellComp))
+    {
+        RestoreWeaponMods();
+        return;
+    }
+
+    const TrackedObjectKey shellComponentKey = MakeTrackedObjectKey(ShellComp);
+    if (!IsTrackedObjectKeyValid(shellComponentKey))
+    {
+        RestoreWeaponMods();
+        return;
+    }
+
+    const bool shellComponentChanged =
+        !g_WeaponModState.HasSnapshot ||
+        !IsTrackedObjectKeyValid(g_WeaponModState.ShellComponentKey) ||
+        !(g_WeaponModState.ShellComponentKey == shellComponentKey);
+    if (shellComponentChanged)
+    {
+        RestoreWeaponMods();
+        g_WeaponModState.ShellComponentKey = shellComponentKey;
         g_WeaponModState.OriginalRecoilTorque = ShellComp->RecoilTorque;
         g_WeaponModState.OriginalBaseGunRecoilTorque = ShellComp->BaseGunRecoilTorque;
         g_WeaponModState.OriginalGunRecoilAlpha = ShellComp->GunRecoilAlpha;
@@ -2649,460 +6558,118 @@ void ApplyWeaponMods()
         g_WeaponModState.HasSnapshot = true;
     }
 
-    if (EmpireFeatures::Get(EmpireFeatures::WeaponMods))
+    constexpr double DesiredRecoilTorque = 0.0;
+    constexpr double DesiredBaseGunRecoilTorque = 0.0;
+    constexpr float DesiredGunRecoilAlpha = 0.0f;
+    constexpr double DesiredDispersionInterpSpeed = 9999.0;
+    constexpr bool DesiredIsPreciseDispersion = true;
+    constexpr double DesiredPreciseDispersionFactor = 0.0;
+    constexpr double DesiredPreciseDispersionDegrees = 0.0;
+    if (g_WeaponModState.HasSnapshot && g_WeaponModState.IsApplied)
     {
-        ShellComp->RecoilTorque = 0.0;
-        ShellComp->BaseGunRecoilTorque = 0.0;
-        ShellComp->GunRecoilAlpha = 0.0f;
-        ShellComp->PubCurrentShotDispersion = 0.0;
-        ShellComp->TargetShotDispersion = 0.0;
-        ShellComp->DispersionInterpSpeed = 9999.0;
-        ShellComp->SmoothedForwardSpeed = 0.0;
-        ShellComp->TurretYawAccumulator = 0.0;
-        ShellComp->bIsPreciseDispersion = true;
-        ShellComp->PreciseDispersionFactor = 0.0;
-        ShellComp->PreciseDispersionDegrees = 0.0;
-        g_WeaponModState.WasAppliedLastFrame = true;
-        return;
+        if (!IsNearDoubleValue(ShellComp->RecoilTorque, DesiredRecoilTorque))
+        {
+            g_WeaponModState.OriginalRecoilTorque = ShellComp->RecoilTorque;
+        }
+
+        if (!IsNearDoubleValue(ShellComp->BaseGunRecoilTorque, DesiredBaseGunRecoilTorque))
+        {
+            g_WeaponModState.OriginalBaseGunRecoilTorque = ShellComp->BaseGunRecoilTorque;
+        }
+
+        if (!IsNearFloatValue(ShellComp->GunRecoilAlpha, DesiredGunRecoilAlpha))
+        {
+            g_WeaponModState.OriginalGunRecoilAlpha = ShellComp->GunRecoilAlpha;
+        }
+
+        if (!IsNearDoubleValue(ShellComp->DispersionInterpSpeed, DesiredDispersionInterpSpeed))
+        {
+            g_WeaponModState.OriginalDispersionInterpSpeed = ShellComp->DispersionInterpSpeed;
+        }
+
+        if (ShellComp->bIsPreciseDispersion != DesiredIsPreciseDispersion)
+        {
+            g_WeaponModState.OriginalIsPreciseDispersion = ShellComp->bIsPreciseDispersion;
+        }
+
+        if (!IsNearDoubleValue(ShellComp->PreciseDispersionFactor, DesiredPreciseDispersionFactor))
+        {
+            g_WeaponModState.OriginalPreciseDispersionFactor = ShellComp->PreciseDispersionFactor;
+        }
+
+        if (!IsNearDoubleValue(ShellComp->PreciseDispersionDegrees, DesiredPreciseDispersionDegrees))
+        {
+            g_WeaponModState.OriginalPreciseDispersionDegrees = ShellComp->PreciseDispersionDegrees;
+        }
     }
 
-    if (g_WeaponModState.WasAppliedLastFrame && g_WeaponModState.ShellComponent == ShellComp)
-    {
-        ShellComp->RecoilTorque = g_WeaponModState.OriginalRecoilTorque;
-        ShellComp->BaseGunRecoilTorque = g_WeaponModState.OriginalBaseGunRecoilTorque;
-        ShellComp->GunRecoilAlpha = g_WeaponModState.OriginalGunRecoilAlpha;
-        ShellComp->DispersionInterpSpeed = g_WeaponModState.OriginalDispersionInterpSpeed;
-        ShellComp->bIsPreciseDispersion = g_WeaponModState.OriginalIsPreciseDispersion;
-        ShellComp->PreciseDispersionFactor = g_WeaponModState.OriginalPreciseDispersionFactor;
-        ShellComp->PreciseDispersionDegrees = g_WeaponModState.OriginalPreciseDispersionDegrees;
-        g_WeaponModState.WasAppliedLastFrame = false;
-    }
+    ShellComp->RecoilTorque = DesiredRecoilTorque;
+    ShellComp->BaseGunRecoilTorque = DesiredBaseGunRecoilTorque;
+    ShellComp->GunRecoilAlpha = DesiredGunRecoilAlpha;
+    ShellComp->PubCurrentShotDispersion = 0.0;
+    ShellComp->TargetShotDispersion = 0.0;
+    ShellComp->DispersionInterpSpeed = DesiredDispersionInterpSpeed;
+    ShellComp->SmoothedForwardSpeed = 0.0;
+    ShellComp->TurretYawAccumulator = 0.0;
+    ShellComp->bIsPreciseDispersion = DesiredIsPreciseDispersion;
+    ShellComp->PreciseDispersionFactor = DesiredPreciseDispersionFactor;
+    ShellComp->PreciseDispersionDegrees = DesiredPreciseDispersionDegrees;
+    g_WeaponModState.IsApplied = true;
 }
 
 void Loop(UCanvas* Canvas) {
     if (!Canvas) return;
 
+    SDK::UWorld* const loopWorld = GetWorld();
+    const bool enableVegetationOptimization = EmpireFeatures::Get(EmpireFeatures::VegetationOptimization);
+    const bool enableAtmosphereEffectMitigation = EmpireFeatures::Get(EmpireFeatures::AtmosphereEffectMitigation);
+    const bool enableTrackedTankCamouflageMitigation = EmpireFeatures::Get(EmpireFeatures::CamouflageMitigation);
+    RefreshAtmosphereEffectMitigation(loopWorld, enableAtmosphereEffectMitigation);
+    RefreshTrackedTankCamouflageMitigationLifecycle(loopWorld, enableTrackedTankCamouflageMitigation);
+    RefreshLocalVehicleModLifecycle(loopWorld);
+
     APlayerController* const playerController = GetPlayerController();
-    if (!playerController) return;
+    if (!playerController)
+    {
+        RestoreAllLocalVehicleModState();
+        DisableAllTrackedArmorVisualization();
+        DisableTrackedTankCamouflageMitigationForCurrentContext();
+        RefreshSceneRenderDistance(loopWorld, nullptr);
+        RefreshVegetationRenderOptimization(loopWorld, false, false);
+        return;
+    }
 
     const FLinearColor StatusColor = GetNeutralOverlayColor();
     std::wstring output = L"Enabled";
     DrawTextSafe(Canvas, FString::FString(output.c_str()), FVector2D(60.f, 60.f), FVector2D(1, 1), StatusColor, 0, FLinearColor{ 0, 0, 0, 1 }, FVector2D(3, 3), 1, 0, 1, FLinearColor{ 0, 0, 0, 1 });
 
     ABP_BaseTank_C* self = GetSelf();
-    if (!IsUsableTank(self)) return;
-
-    if (EmpireFeatures::Get(EmpireFeatures::ArmorVisualization))
+    if (!IsUsableTank(self))
     {
-        RefreshLocalArmorVisualizationContext(self);
+        RestoreAllLocalVehicleModState();
+        DisableAllTrackedArmorVisualization();
+        DisableTrackedTankCamouflageMitigationForCurrentContext();
+        RefreshSceneRenderDistance(loopWorld, nullptr);
+        RefreshVegetationRenderOptimization(loopWorld, false, false);
+        return;
     }
 
+    const bool useNativeSniperArmorVisualization = IsLocalSniperVisualizationActive(playerController, self);
+    RefreshVegetationRenderOptimization(loopWorld, enableVegetationOptimization, useNativeSniperArmorVisualization);
+    RefreshSceneRenderDistance(loopWorld, self);
 
-      auto tyr = GetTyrGameActionMessageStatics();
-    //// 1. Ensure the static helper is valid (if it's a pointer-based static)
-    //// and that GetSelf() returns a valid actor
-    //if (GetSelf())
-    //{
-    //    auto ps_self = tyr.GetTyrPlayerStateFromObject(GetSelf());
+    RefreshMotionSicknessMitigation(GetWorld(), playerController, self);
 
-    //    // 2. Check if the PlayerState was successfully retrieved
-    //    if (ps_self)
-    //    {
-    //        // 3. Check if the PlayerRecord struct/class is allocated
-    //        if (ps_self->PlayerRecord)
-    //        {
-    //            // 4. Perform the assignment safely
-    //            FString NewTitle = L"Pilot";
-    //            ps_self->PlayerRecord->PlayerTitle.TagName = GetUKismetStringLibrary().Conv_StringToName(NewTitle);
-
-    //            DebugPrintf("Successfully updated PlayerTitle to: %ws", NewTitle.CStr());
-    //        }
-    //        else
-    //        {
-    //            DebugPrintf("Fail: PlayerRecord is NULL");
-    //        }
-    //    }
-    //    else
-    //    {
-    //        DebugPrintf("Fail: ps_self is NULL");
-    //    }
-    //}
-
-
-
-
-      if (GetAsyncKeyState(VK_NEXT) & 0x8000) // VK_NEXT is Page Down
-      {
-          // Get current rotation
-          SDK::FRotator CurrentRot = self->K2_GetActorRotation();
-
-          // Add 2.0 degrees to the Yaw (horizontal rotation)
-          CurrentRot.Yaw += 5.0f;
-
-          // Apply the new rotation
-          self->K2_SetActorRotation(CurrentRot, true); // true = teleport/smooth update
-      }
-
-
-
-    ApplyTurretMods((self->TurretComponent && ISVALID(self->TurretComponent)) ? self->TurretComponent : nullptr);
-
-
-    ApplyWeaponMods();
-
-
-
-
-
-
-
-
-
-
-    //GunSocketName = GetUKismetStringLibrary().Conv_StringToName(L"jnt_muzzle");
-
-    //// 1. Get the primary visual mesh from the SDK object
-    //SDK::UMeshComponent* PhysicsMesh = GetSelf()->VisualMesh;
-
-    //if (PhysicsMesh && PhysicsMesh->IsA(SDK::USkeletalMeshComponent::StaticClass()) && GetPlayerController())
-    //{
-    //    auto SkelMesh = static_cast<SDK::USkeletalMeshComponent*>(PhysicsMesh);
-    //    int32 NumBones = SkelMesh->GetNumBones();
-
-    //    for (int32 i = 0; i < NumBones; i++)
-    //    {
-    //        // 2. Get the bone name using the SDK's FName wrapper
-    //        SDK::FName BoneName = SkelMesh->GetBoneName(i);
-    //        std::string BoneNameStr = BoneName.ToString(); // Dumper7 FName::ToString() returns std::string
-
-    //        // 3. Format the string using standard C++ (since FString::Printf is a Kismet helper)
-    //        // Format: "24: bone_name"
-    //        std::string FormattedStr = std::to_string(i) + ": " + BoneNameStr;
-
-    //        // 4. Convert back to the SDK's FString for K2_DrawText
-    //        // Most Dumper7 SDKs have a constructor or assignment for this
-    //        SDK::FString FinalDisplayString(std::wstring(FormattedStr.begin(), FormattedStr.end()).c_str());
-
-    //        // 5. Get World Position
-    //        SDK::FVector WorldPos = SkelMesh->GetSocketLocation(BoneName);
-    //        SDK::FVector2D ScreenPos;
-
-    //        if (GetPlayerController()->ProjectWorldLocationToScreen(WorldPos, &ScreenPos, true))
-    //        {
-    //            // Draw a tiny dot for the bone joint
-    //            Canvas->K2_DrawBox(ScreenPos - SDK::FVector2D(1, 1), SDK::FVector2D(2, 2), 1.0f, { 0, 1, 0, 1 }); // Green
-
-    //            // 6. Draw the Bone Number and Name
-    //            Canvas->K2_DrawText(
-    //                get_roboto(),
-    //                FinalDisplayString,
-    //                ScreenPos + SDK::FVector2D(5, 0),
-    //                SDK::FVector2D(0.6f, 0.6f),
-    //                { 0, 1, 0, 1 }, // Text Color: Green
-    //                1.0f,
-    //                { 0, 0, 0, 1 }, // Shadow Color: Black
-    //                SDK::FVector2D(1, 1),
-    //                false, false, true,
-    //                { 0, 0, 0, 1 }
-    //            );
-    //        }
-
-    //        // 7. Debug Print (ANSI)
-    //        DebugPrintf("Bone[%03d] = %s", i, BoneNameStr.c_str());
-    //    }
-    //}
-
-
-
-    static bool bDumpedDataTables = false;
-    if (GetAsyncKeyState(VK_NUMPAD7) & 0x8000)
+    static bool s_HadLocalSniperVisualizationActive = false;
+    const bool shouldRefreshLocalArmorVisualizationContext =
+        EmpireFeatures::Get(EmpireFeatures::ArmorVisualization) ||
+        useNativeSniperArmorVisualization ||
+        s_HadLocalSniperVisualizationActive;
+    if (shouldRefreshLocalArmorVisualizationContext)
     {
-        if (!bDumpedDataTables)
-        {
-            DumpDataTablesAsRaw();
-            bDumpedDataTables = true;
-        }
+        RefreshLocalArmorVisualizationContext(playerController, self);
     }
-    else
-    {
-        bDumpedDataTables = false;
-    }
-
-
-
-
-    //static bool bspec = false;
-    //if (GetAsyncKeyState(VK_NUMPAD6) & 0x8000)
-    //{
-    //    if (!bspec)
-    //    {
-    //        auto pc = (SDK::ATyrPlayerControllerBase*)GetPlayerController();
-    //        pc->EnableCheats();
-    //        pc->ServerCheats();
-    //        pc->OpenCheatsMenu();
-
-    //        UTyrCheatManager* CheatMgr = (UTyrCheatManager*)GetPlayerController()->CheatManager;
-    //        if (!CheatMgr)
-    //        {
-    //            // CheatManager not instantiated yet
-    //            return;
-    //        }
-    //        
-    //        CheatMgr->TyrDebugCamera();
-
-    //        CheatMgr->SetConsoleReloadTime(0.f);
-    //    }
-    //}
-    //else
-    //{
-    //    bspec = false;
-    //}
-
-
-
-
-
-    static bool bBonesHaveBeenDumped = false;
-    if (GetAsyncKeyState(VK_NUMPAD0) & 0x8000)
-    {
-        if (!bBonesHaveBeenDumped)
-        {
-            DebugPrintf("Dumping bones from ArmorPartsMeshList...");
-            if (self && self->ArmorPartsMeshList.Num() > 0)
-            {
-                for (int i = 0; i < self->ArmorPartsMeshList.Num(); i++)
-                {
-                    UMeshComponent* MeshPart = self->ArmorPartsMeshList[i];
-                    if (MeshPart && MeshPart->IsA(USkeletalMeshComponent::StaticClass()))
-                    {
-                        auto SkelMeshPart = static_cast<USkeletalMeshComponent*>(MeshPart);
-                        DebugPrintf("[Part %d] Mesh: %s", i, SkelMeshPart->GetName().c_str());
-
-                        int32 NumBones = SkelMeshPart->GetNumBones();
-                        for (int32 j = 0; j < NumBones; j++)
-                        {
-                            FName BoneName = SkelMeshPart->GetBoneName(j);
-                            if (!BoneName.ToString().empty())
-                            {
-                                DebugPrintf("  [Bone %d] %s", j, BoneName.ToString().c_str());
-                            }
-                        }
-                    }
-                    else
-                    {
-                        DebugPrintf("[Part %d] Not a SkeletalMeshComponent.", i);
-                    }
-                }
-            }
-            else
-            {
-                DebugPrintf("ArmorPartsMeshList is empty or self is null.");
-            }
-            bBonesHaveBeenDumped = true;
-        }
-    }
-    else
-    {
-        bBonesHaveBeenDumped = false;
-    }
-
-    if (GetAsyncKeyState(VK_NUMPAD9) & 0x8000)
-    {
-        APlayerController* PC = playerController;
-        if (!PC) return;
-
-        UWorld* World = GetWorld();
-        if (World && World->PersistentLevel)
-        {
-            for (AActor* Actor : World->PersistentLevel->Actors)
-            {
-                if (Actor && Actor->IsA(ATyrPlayerStateBase::StaticClass()))
-                {
-                    auto PlayerState = static_cast<ATyrPlayerStateBase*>(Actor);
-                    if (PlayerState && IsUsableObject(PlayerState->PawnPrivate))
-                    {
-                        FVector worldLocation = PlayerState->PawnPrivate->K2_GetActorLocation();
-                        FVector2D screenLocation;
-                        if (PC->ProjectWorldLocationToScreen(worldLocation, &screenLocation, true))
-                        {
-                            int sx, sy;
-                            PC->GetViewportSize(&sx, &sy);
-                            FVector2D screen_center(sx / 2.0f, sy / 2.0f);
-                            Canvas->K2_DrawLine(screen_center, screenLocation, 1.0f, FLinearColors::Yellow);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-
-    static std::wstring targetedBoneName = L"";
-    static FVector2D targetedBoneScreenLocation;
-    bool hasTargetedBoneThisFrame = false;
-
-    if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000)
-    {
-        DebugPrintf("VK_NUMPAD4 team mutation path disabled for safety.");
-    }
-
-    if (GetAsyncKeyState(VK_NUMPAD5) & 0x8000)
-    {
-        auto self_sight_component = self->GetComponentByClass(UTyrPlayerSightComponent::StaticClass());
-        if (self_sight_component)
-        {
-            auto sight_comp = static_cast<UTyrPlayerSightComponent*>(self_sight_component);
-            auto spotted_effect = sight_comp->SpottedGamePlayEffectClass;
-
-            UWorld* World = GetWorld();
-            if (World)
-            {
-                ULevel* Level = World->PersistentLevel;
-                if (Level)
-                {
-                    TArray<AActor*>& Actors = Level->Actors;
-                    for (AActor* Actor : Actors)
-                    {
-                        if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
-                            continue;
-
-                        auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
-                        if (Player == self) continue;
-
-                        auto player_sight_component = Player->GetComponentByClass(UTyrPlayerSightComponent::StaticClass());
-                        if (player_sight_component)
-                        {
-                            auto other_sight_comp = static_cast<UTyrPlayerSightComponent*>(player_sight_component);
-                            
-                            // 1. Call the Native Spotting Functions
-                            if (playerController)
-                            {
-                                other_sight_comp->K2_SpottedPlayer(playerController);
-                                other_sight_comp->NotifySpottedPlayer(playerController);
-                            }
-
-                            // 2. Apply the Spotted Gameplay Effect (If Valid)
-                            if (spotted_effect)
-                            {
-                                auto target_asc = other_sight_comp->AbilitySystemComponent;
-                                auto source_asc = sight_comp->AbilitySystemComponent;
-
-                                if (source_asc && target_asc)
-                                {
-                                    source_asc->BP_ApplyGameplayEffectToTarget(spotted_effect, target_asc, 1.0f, FGameplayEffectContextHandle());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (GetAsyncKeyState(VK_NUMPAD6))
-    {
-        DebugPrintf("VK_NUMPAD6 pressed.");
-        APlayerController* player_controller = playerController;
-        if (player_controller)
-        {
-            FVector camera_loc;
-            FRotator camera_rot;
-            player_controller->GetPlayerViewPoint(&camera_loc, &camera_rot);
-
-            FVector forward_vector = UKismetMathLibrary::GetForwardVector(camera_rot);
-            FVector trace_start = camera_loc; // Start trace from the camera location
-            FVector trace_end = trace_start + (forward_vector * 1000000.0f);
-
-            TArray<FHitResult> AllHitResults;
-            bool bAnyHit = false;
-            UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
-                self,
-                trace_start,
-                trace_end,
-                ETraceTypeQuery::TraceTypeQuery1,
-                GetWorld(),
-                &AllHitResults,
-                &bAnyHit
-            );
-
-            if (bAnyHit)
-            {
-                SDK::FHitResult firstBlockingHit{};
-                if (TryGetFirstBlockingHit(AllHitResults, &firstBlockingHit) && firstBlockingHit.Component.Get())
-                {
-                    AActor* hit_actor = firstBlockingHit.Component.Get()->GetOwner();
-                    if (hit_actor && hit_actor->IsA(ATyrWheeledVehiclePawnBase::StaticClass()))
-                    {
-                        DebugPrintf("Hit actor is a vehicle: %s", hit_actor->GetName().c_str());
-                        auto target_vehicle = static_cast<ATyrWheeledVehiclePawnBase*>(hit_actor);
-                        if (target_vehicle)
-                        {
-                            bool bSuccess = false;
-                            FVector OutTriangleNormal, OutTriangleLocation;
-                            FName ArmorName, ModuleName;
-                            FTyrArmorColor ArmorColorValue;
-                            FTyrModuleArmorColor ModuleColorValue;
-
-                            target_vehicle->GetArmorColorsFromHit_Implementation(firstBlockingHit, &bSuccess, &OutTriangleNormal, &OutTriangleLocation, &ArmorName, &ModuleName, &ArmorColorValue, &ModuleColorValue);
-
-
-
-
-
-                            if (bSuccess)
-                            {
-                                int32 armor_thickness = UTyrArmorFunctionLibrary::GetArmorThickness(ArmorColorValue);
-                                DebugPrintf("Armor info retrieved: %s (%dmm)", ArmorName.ToString().c_str(), armor_thickness);
-
-                                std::string armor_name_str = ModuleName.ToString();
-                                std::wstring armor_name_wstr(armor_name_str.begin(), armor_name_str.end());
-                                std::wstring armor_info_str = L"Armor: " + armor_name_wstr + L" (" + std::to_wstring(armor_thickness) + L"mm)";
-                                auto tyr = GetTyrGameActionMessageStatics();
-                                auto ps_self = tyr.GetTyrPlayerStateFromObject(self);
-                                
-                                float self_pen = 0.0f;
-                                if (ps_self && ps_self->VehicleStatsAttribute)
-                                {
-                                    self_pen = ps_self->VehicleStatsAttribute->ShellPenetration.BaseValue;
-                                }
-
-
-                                if (self_pen > 0 && self_pen >= armor_thickness) {
-                                    DebugPrintf("Self Penetration: %fmm, Enemy Armor: (%dmm)", self_pen, armor_thickness);
-                                    //  GetSelf()->ActivateMainWeapon(true);
-                                    DebugPrintf("Activate weapon!");
-                                }
-
-
-                                int sx, sy;
-                                player_controller->GetViewportSize(&sx, &sy);
-                                FVector2D screen_center(sx / 2.0f, sy / 2.0f);
-
-                                DrawTextSafe(Canvas, FString(armor_info_str.c_str()), screen_center, FVector2D(1.f, 1.f), GetNeutralOverlayColor(), 1.0f, FLinearColor(0.f, 0.f, 0.f, 1.f), FVector2D(1.f, 1.f), true, true, true, FLinearColor(0.f, 0.f, 0.f, 0.7f));
-                            }
-                            else
-                            {
-                                DebugPrintf("GetArmorColorsFromHit_Implementation failed for %s.", hit_actor->GetName().c_str());
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    DebugPrintf("Line trace did not produce a blocking hit.");
-                }
-            }
-            else
-            {
-                DebugPrintf("Line trace did not hit anything.");
-            }
-        }
-    }
-
-    if (hasTargetedBoneThisFrame)
-    {
-        DrawTextSafe(Canvas, FString(targetedBoneName.c_str()), targetedBoneScreenLocation, FVector2D(1.f, 1.f), FLinearColor{ 1.f, 1.f, 0.f, 1.f }, 1.0f, FLinearColor(0.f, 0.f, 0.f, 1.f), FVector2D(1.f, 1.f), true, true, true, FLinearColor(0.f, 0.f, 0.f, 0.7f));
-    }
+    s_HadLocalSniperVisualizationActive = useNativeSniperArmorVisualization;
 
     UWorld* World = GetWorld();
     if (World)
@@ -3113,21 +6680,8 @@ void Loop(UCanvas* Canvas) {
         const bool drawShotOriginIndicators = EmpireFeatures::Get(EmpireFeatures::ShotOriginIndicators);
         const bool drawShellTrajectoryIndicators = EmpireFeatures::Get(EmpireFeatures::ShellTrajectoryIndicators);
         const bool enableArmorVisualization = EmpireFeatures::Get(EmpireFeatures::ArmorVisualization);
-        const bool useNativeSniperArmorVisualization = IsLocalSniperVisualizationActive(self);
-        const bool forceAlwaysOnArmorVisualization = enableArmorVisualization && !useNativeSniperArmorVisualization;
-        static bool s_PreviousUseNativeSniperArmorVisualization = false;
-        const bool enteredNativeSniperArmorVisualization = useNativeSniperArmorVisualization && !s_PreviousUseNativeSniperArmorVisualization;
-        s_PreviousUseNativeSniperArmorVisualization = useNativeSniperArmorVisualization;
-
-        if (!drawTankBoxes &&
-            !drawTankLabels &&
-            !drawLastKnownIndicators &&
-            !drawShotOriginIndicators &&
-            !drawShellTrajectoryIndicators &&
-            !enableArmorVisualization)
-        {
-            return;
-        }
+        const bool shouldMaintainArmorVisualizationState =
+            enableArmorVisualization || useNativeSniperArmorVisualization;
 
         auto tyr = GetTyrGameActionMessageStatics();
         auto self_ps = tyr.GetTyrPlayerStateFromObject(self);
@@ -3138,8 +6692,23 @@ void Loop(UCanvas* Canvas) {
         const FVector localFireOrigin = GetEstimatedTankFireOrigin(self);
         const float selfShellPenetration = GetCurrentShellPenetration(self, self_ps);
         ULevel* Level = World->PersistentLevel;
+        std::set<std::string> activeArmorVisualizationEntityKeys;
+        std::set<TrackedObjectKey> activeTrackedTankCamouflageVehicleStatsKeys;
         if (Level)
         {
+            if (!drawTankBoxes &&
+                !drawTankLabels &&
+                !drawLastKnownIndicators &&
+                !drawShotOriginIndicators &&
+                !drawShellTrajectoryIndicators &&
+                !enableArmorVisualization &&
+                !useNativeSniperArmorVisualization &&
+                !enableTrackedTankCamouflageMitigation)
+            {
+                DisableAllTrackedArmorVisualization();
+                return;
+            }
+
             std::set<std::string> currentIndicatorsThisFrame;
             ProjectileOwnerLookup projectileOwnerLookup{};
             ProjectileTrackingContext projectileTrackingContext{};
@@ -3167,21 +6736,17 @@ void Loop(UCanvas* Canvas) {
                 auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
                 if (!IsUsableTank(Player) || Player == self) continue;
 
-                auto* const physicsMesh = Player->GetPhysicsMesh();
-                if (!physicsMesh || !ISVALID(physicsMesh)) continue;
-
-                const int32 physicsBoneCount = physicsMesh->GetNumBones();
-                if (physicsBoneCount <= 0) continue;
-
                 auto player_ps = tyr.GetTyrPlayerStateFromObject(Player);
                 if (!player_ps)
                 {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
                     continue;
                 }
 
                 const std::string entityKey = BuildTrackedEntityKey(Player, player_ps);
                 if (entityKey.empty())
                 {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
                     continue;
                 }
 
@@ -3211,30 +6776,58 @@ void Loop(UCanvas* Canvas) {
 
                 if (!bHasTeamRelation)
                 {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
                     ClearTrackedEntityState(entityKey);
                     continue;
                 }
 
                 if (!bIsEnemy)
                 {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
                     ClearTrackedEntityState(entityKey);
                     continue;
                 }
 
                 if (Player->IsActorBeingDestroyed() || !IsLivePlayerStateAlive(player_ps))
                 {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
                     ClearTrackedEntityState(entityKey);
                     continue;
                 }
 
+                if (enableTrackedTankCamouflageMitigation)
+                {
+                    TrackAndApplyTrackedTankCamouflageMitigation(
+                        player_ps,
+                        &activeTrackedTankCamouflageVehicleStatsKeys);
+                }
+
+                auto* const physicsMesh = Player->GetPhysicsMesh();
+                if (!physicsMesh || !ISVALID(physicsMesh))
+                {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
+                    continue;
+                }
+
+                const int32 physicsBoneCount = physicsMesh->GetNumBones();
+                if (physicsBoneCount <= 0)
+                {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
+                    continue;
+                }
+
                 RefreshEnemyShellFireMarker(entityKey, Player, vehicleName);
+                RefreshTrackedEntityReloadInfo(entityKey, World, Player);
 
                 const int32 headBoneIndex = physicsBoneCount > 6 ? 6 : 0;
                 FVector rootPos = physicsMesh->GetSocketLocation(physicsMesh->GetBoneName(0));
                 FVector headPos = physicsMesh->GetSocketLocation(physicsMesh->GetBoneName(headBoneIndex));
-                if (rootPos.IsZero() && headPos.IsZero()) continue;
-
-                RefreshTrackedEntityLastKnownLocation(entityKey, vehicleName, rootPos, headPos);
+                if (rootPos.IsZero() && headPos.IsZero())
+                {
+                    DisableAlwaysOnEnemyArmorVisualization(Player);
+                    ClearTrackedEntityState(entityKey);
+                    continue;
+                }
 
                 FVector2D rootScreen, headScreen;
 
@@ -3242,16 +6835,48 @@ void Loop(UCanvas* Canvas) {
                 bool headOnScreen = playerController->ProjectWorldLocationToScreen(headPos, &headScreen, true);
                 const bool hasScreenPresence = rootOnScreen || headOnScreen;
 
-                if (useNativeSniperArmorVisualization)
+                bool bPlayerPartiallyVisible = false;
+                int32 bestVisiblePenetrationTier = kBlockedPenetrationTier;
+                const bool shouldAssessVisiblePenetration =
+                    hasScreenPresence &&
+                    !localFireOrigin.IsZero() &&
+                    selfShellPenetration > 0.0f;
+                if (shouldAssessVisiblePenetration)
                 {
-                    if (enteredNativeSniperArmorVisualization)
+                    TryEvaluateBestVisiblePenetrationTier(
+                        World,
+                        self,
+                        Player,
+                        cameraLoc,
+                        localFireOrigin,
+                        selfShellPenetration,
+                        &bPlayerPartiallyVisible,
+                        &bestVisiblePenetrationTier);
+
+                    if (bPlayerPartiallyVisible)
                     {
-                        DisableAlwaysOnEnemyArmorVisualization(Player);
+                        RefreshTrackedEntityPenetrationColor(entityKey, bestVisiblePenetrationTier);
                     }
                 }
-                else if (forceAlwaysOnArmorVisualization && hasScreenPresence)
+
+                const bool shouldUseNativeSniperArmorVisualizationForTarget =
+                    useNativeSniperArmorVisualization &&
+                    hasScreenPresence &&
+                    bPlayerPartiallyVisible;
+                const bool shouldUseAlwaysOnArmorVisualizationForTarget =
+                    !useNativeSniperArmorVisualization &&
+                    enableArmorVisualization &&
+                    hasScreenPresence &&
+                    bPlayerPartiallyVisible;
+                if (shouldUseNativeSniperArmorVisualizationForTarget)
                 {
-                    ForceAlwaysOnEnemyArmorVisualization(entityKey, Player, self);
+                    activeArmorVisualizationEntityKeys.insert(entityKey);
+                    PrepareEnemyArmorVisualizationForNativeSniper(entityKey, Player);
+                }
+                else if (shouldUseAlwaysOnArmorVisualizationForTarget)
+                {
+                    activeArmorVisualizationEntityKeys.insert(entityKey);
+                    ForceAlwaysOnEnemyArmorVisualization(entityKey, Player);
                 }
                 else
                 {
@@ -3261,28 +6886,19 @@ void Loop(UCanvas* Canvas) {
                 if (rootOnScreen) // A single point on screen is enough to try drawing the box
                 {
                     const auto Color = GetRelationshipOverlayColor(self_ps, player_ps);
-                    bool bPlayerPartiallyVisible = false;
-                    int32 bestVisiblePenetrationTier = kBlockedPenetrationTier;
 
-                    if (!localFireOrigin.IsZero() && selfShellPenetration > 0.0f)
+                    const std::wstring display_str =
+                        BuildEntityLabel(vehicleName, self->K2_GetActorLocation(), rootPos);
+                    const TrackedEntityReloadDisplay reloadDisplay = BuildTrackedEntityReloadDisplay(entityKey);
+                    SDK::FVector predictionAimReference = headPos;
+                    if (!rootPos.IsZero() && !headPos.IsZero())
                     {
-                        TryEvaluateBestVisiblePenetrationTier(
-                            World,
-                            self,
-                            Player,
-                            cameraLoc,
-                            localFireOrigin,
-                            selfShellPenetration,
-                            &bPlayerPartiallyVisible,
-                            &bestVisiblePenetrationTier);
-
-                        if (bPlayerPartiallyVisible)
-                        {
-                            RefreshTrackedEntityPenetrationColor(entityKey, bestVisiblePenetrationTier);
-                        }
+                        predictionAimReference = (rootPos + headPos) * 0.5;
                     }
-
-                    const std::wstring display_str = BuildEntityLabel(vehicleName, self->K2_GetActorLocation(), rootPos);
+                    else if (predictionAimReference.IsZero())
+                    {
+                        predictionAimReference = rootPos;
+                    }
 
                     if (bHasTeamRelation && bPlayerPartiallyVisible && bIsEnemy)
                     {
@@ -3303,7 +6919,13 @@ void Loop(UCanvas* Canvas) {
                         if (drawTankLabels)
                         {
                             DrawTextSafe(Canvas, FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15.0f), FVector2D(1.f, 1.f), Color, 1.0f, FLinearColor{ 0.f, 0.f, 0.f, 1.f }, FVector2D(0.f, 0.f), true, true, true, FLinearColor{ 0.f, 0.f, 0.f, 0.7f });
+                            if (reloadDisplay.HasDisplay)
+                            {
+                                DrawTextSafe(Canvas, FString(reloadDisplay.Text.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 31.0f), FVector2D(0.9f, 0.9f), reloadDisplay.Color, 1.0f, FLinearColor{ 0.f, 0.f, 0.f, 1.f }, FVector2D(0.f, 0.f), true, true, true, FLinearColor{ 0.f, 0.f, 0.f, 0.7f });
+                            }
                         }
+
+                        DrawTrackedTargetPredictionCircle(Canvas, playerController, World, self, self_ps, entityKey, Player, predictionAimReference);
                     }
                     else
                     {
@@ -3321,9 +6943,29 @@ void Loop(UCanvas* Canvas) {
                         if (drawTankLabels)
                         {
                             DrawTextSafe(Canvas, FString(display_str.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 15.0f), FVector2D(1.f, 1.f), Color, 1.0f, FLinearColor{ 0.f, 0.f, 0.f, 1.f }, FVector2D(0.f, 0.f), true, true, true, FLinearColor{ 0.f, 0.f, 0.f, 0.7f });
+                            if (reloadDisplay.HasDisplay)
+                            {
+                                DrawTextSafe(Canvas, FString(reloadDisplay.Text.c_str()), FVector2D(rootScreen.X, rootScreen.Y + 31.0f), FVector2D(0.9f, 0.9f), reloadDisplay.Color, 1.0f, FLinearColor{ 0.f, 0.f, 0.f, 1.f }, FVector2D(0.f, 0.f), true, true, true, FLinearColor{ 0.f, 0.f, 0.f, 0.7f });
+                            }
                         }
+
+                        DrawTrackedTargetPredictionCircle(Canvas, playerController, World, self, self_ps, entityKey, Player, predictionAimReference);
                     }
                 }
+            }
+
+            if (shouldMaintainArmorVisualizationState)
+            {
+                ReconcileTrackedArmorVisualizationTargets(activeArmorVisualizationEntityKeys);
+            }
+            else
+            {
+                DisableAllTrackedArmorVisualization();
+            }
+
+            if (enableTrackedTankCamouflageMitigation)
+            {
+                ReconcileTrackedTankCamouflageMitigation(activeTrackedTankCamouflageVehicleStatsKeys);
             }
 
             if (drawShellTrajectoryIndicators || drawShotOriginIndicators)
@@ -3425,5 +7067,18 @@ void Loop(UCanvas* Canvas) {
                 }
             }
         }
+        else
+        {
+            DisableAllTrackedArmorVisualization();
+
+            if (enableTrackedTankCamouflageMitigation)
+            {
+                ReconcileTrackedTankCamouflageMitigation(activeTrackedTankCamouflageVehicleStatsKeys);
+            }
+        }
+    }
+    else
+    {
+        DisableAllTrackedArmorVisualization();
     }
 }

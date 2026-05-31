@@ -427,3 +427,11 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local build output directories generated at the repo root
+/Tyr/
+/x64/
+
+# Local Codex / MCP scratch artifacts
+/mcp_*.json
+/datatables.txt

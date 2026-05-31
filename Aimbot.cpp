@@ -134,6 +134,33 @@ static bool IsAimKeyDown()
     return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0;
 }
 
+static bool IsRangefinderKeyDown()
+{
+    return (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
+}
+
+static bool IsAutoLockKeyDown()
+{
+    return (GetAsyncKeyState('C') & 0x8000) != 0;
+}
+
+static void SampleAutoLockKeyState(bool* outIsDown, bool* outJustPressed)
+{
+    static bool s_WasDown = false;
+    const bool isDown = IsAutoLockKeyDown();
+    if (outIsDown)
+    {
+        *outIsDown = isDown;
+    }
+
+    if (outJustPressed)
+    {
+        *outJustPressed = isDown && !s_WasDown;
+    }
+
+    s_WasDown = isDown;
+}
+
 static int GetConfiguredAimFovPixels()
 {
     int aimFov = EmpireFeatures::Get(EmpireFeatures::AimFov);
@@ -200,6 +227,11 @@ static bool GetViewportHalfExtents(
     SDK::APlayerController* playerController,
     float* outHalfWidth,
     float* outHalfHeight);
+
+static bool TryProjectWorldLocationToReasonableScreenPosition(
+    SDK::APlayerController* playerController,
+    const SDK::FVector& worldLocation,
+    SDK::FVector2D* outScreenPosition);
 
 static float GetResolutionIndependentAcquireScore(
     SDK::APlayerController* playerController,
@@ -596,11 +628,23 @@ static bool TryGetVisibleTargetHitForBone(
     const SDK::FVector& fireOrigin,
     const SDK::FVector& boneWorldLoc,
     SDK::FHitResult* outTargetHit,
-    SDK::FVector* outAimPoint = nullptr)
+    SDK::FVector* outAimPoint = nullptr,
+    SDK::USkeletalMeshComponent** outVisibleProbeComponent = nullptr,
+    SDK::FName* outVisibleProbeBoneName = nullptr)
 {
     if (!world || !IsUsableTank(self) || !IsUsableTank(target) || !outTargetHit || boneWorldLoc.IsZero())
     {
         return false;
+    }
+
+    if (outVisibleProbeComponent)
+    {
+        *outVisibleProbeComponent = nullptr;
+    }
+
+    if (outVisibleProbeBoneName)
+    {
+        *outVisibleProbeBoneName = SDK::FName{};
     }
 
     TArray<FHitResult> allHitResults;
@@ -641,6 +685,23 @@ static bool TryGetVisibleTargetHitForBone(
         return false;
     }
 
+    if ((outVisibleProbeComponent || outVisibleProbeBoneName) &&
+        visibleSurfaceHit.Component.Get() &&
+        visibleSurfaceHit.Component.Get()->IsA(SDK::USkeletalMeshComponent::StaticClass()) &&
+        !visibleSurfaceHit.BoneName.IsNone())
+    {
+        auto* const visibleProbeComponent = static_cast<SDK::USkeletalMeshComponent*>(visibleSurfaceHit.Component.Get());
+        if (outVisibleProbeComponent)
+        {
+            *outVisibleProbeComponent = visibleProbeComponent;
+        }
+
+        if (outVisibleProbeBoneName)
+        {
+            *outVisibleProbeBoneName = visibleSurfaceHit.BoneName;
+        }
+    }
+
     if (outAimPoint)
     {
         *outAimPoint = resolvedAimPoint;
@@ -664,6 +725,7 @@ struct TargetWeakpointEvaluation
     float EffectiveThickness = FLT_MAX;
     int32 ArmorThickness = 0x7fffffff;
     int32 PenetrationTier = 2;
+    bool HasModuleHit = false;
     bool HasCandidate = false;
 };
 
@@ -771,6 +833,11 @@ static bool IsBetterWeakpointCandidateForTarget(
     }
 
     constexpr float kCompareEpsilon = 0.0001f;
+    if (Candidate.HasModuleHit != CurrentBest.HasModuleHit)
+    {
+        return Candidate.HasModuleHit;
+    }
+
     if (Candidate.PenetrationTier != CurrentBest.PenetrationTier)
     {
         return Candidate.PenetrationTier < CurrentBest.PenetrationTier;
@@ -843,6 +910,11 @@ static bool IsBetterTargetSelection(
     }
 
     constexpr float kCompareEpsilon = 0.0001f;
+    if (Candidate.HasModuleHit != CurrentBest.HasModuleHit)
+    {
+        return Candidate.HasModuleHit;
+    }
+
     if (Candidate.PenetrationTier != CurrentBest.PenetrationTier)
     {
         return Candidate.PenetrationTier < CurrentBest.PenetrationTier;
@@ -979,7 +1051,7 @@ static bool TryEvaluateBestWeakpointForTarget(
         if (!seedBoneWorldLoc.IsZero())
         {
             SDK::FVector2D seedScreenPosition{};
-            if (playerController->ProjectWorldLocationToScreen(seedBoneWorldLoc, &seedScreenPosition, true))
+            if (TryProjectWorldLocationToReasonableScreenPosition(playerController, seedBoneWorldLoc, &seedScreenPosition))
             {
                 boneProbes.push_back(BoneProbeCandidate{
                     seedProbeComponent,
@@ -1022,7 +1094,7 @@ static bool TryEvaluateBestWeakpointForTarget(
             }
 
             SDK::FVector2D boneScreenPosition{};
-            if (!playerController->ProjectWorldLocationToScreen(boneWorldLoc, &boneScreenPosition, true))
+            if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, boneWorldLoc, &boneScreenPosition))
             {
                 continue;
             }
@@ -1062,7 +1134,19 @@ static bool TryEvaluateBestWeakpointForTarget(
 
         FHitResult targetArmorHit{};
         FVector candidateAimPoint{};
-        if (!TryGetVisibleTargetHitForBone(world, self, target, cameraLoc, fireOrigin, boneProbe.BoneWorldLocation, &targetArmorHit, &candidateAimPoint))
+        SDK::USkeletalMeshComponent* visibleProbeComponent = nullptr;
+        SDK::FName visibleProbeBoneName{};
+        if (!TryGetVisibleTargetHitForBone(
+                world,
+                self,
+                target,
+                cameraLoc,
+                fireOrigin,
+                boneProbe.BoneWorldLocation,
+                &targetArmorHit,
+                &candidateAimPoint,
+                &visibleProbeComponent,
+                &visibleProbeBoneName))
         {
             continue;
         }
@@ -1083,7 +1167,7 @@ static bool TryEvaluateBestWeakpointForTarget(
         }
 
         SDK::FVector2D candidateScreenPosition{};
-        if (!playerController->ProjectWorldLocationToScreen(candidateAimPoint, &candidateScreenPosition, true))
+        if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, candidateAimPoint, &candidateScreenPosition))
         {
             continue;
         }
@@ -1098,8 +1182,14 @@ static bool TryEvaluateBestWeakpointForTarget(
         candidate.Target = target;
         candidate.AimComponent = targetArmorHit.Component.Get();
         candidate.AimBoneName = targetArmorHit.BoneName;
-        candidate.ProbeComponent = boneProbe.ProbeComponent;
-        candidate.ProbeBoneName = boneProbe.ProbeBoneName;
+        candidate.ProbeComponent =
+            IsUsableObject(visibleProbeComponent) && !visibleProbeBoneName.IsNone()
+            ? visibleProbeComponent
+            : boneProbe.ProbeComponent;
+        candidate.ProbeBoneName =
+            IsUsableObject(visibleProbeComponent) && !visibleProbeBoneName.IsNone()
+            ? visibleProbeBoneName
+            : boneProbe.ProbeBoneName;
         candidate.AimPoint = candidateAimPoint;
         candidate.FirstHitLabel = BuildFirstHitClassificationLabel(surfaceAssessment.ModuleName, surfaceAssessment.ArmorName, targetArmorHit) +
             " pen=" + GetPenetrationTierLabel(surfaceAssessment.PenetrationTier);
@@ -1108,6 +1198,7 @@ static bool TryEvaluateBestWeakpointForTarget(
         candidate.EffectiveThickness = surfaceAssessment.EffectiveThickness;
         candidate.ArmorThickness = surfaceAssessment.ArmorThickness;
         candidate.PenetrationTier = surfaceAssessment.PenetrationTier;
+        candidate.HasModuleHit = !surfaceAssessment.ModuleName.IsNone();
         candidate.HasCandidate = true;
 
         if (IsBetterWeakpointCandidateForTarget(candidate, bestCandidate, preferredComponent))
@@ -1240,21 +1331,28 @@ static SDK::FVector GetFireOrigin(SDK::ABP_BaseTank_C* self)
     if (!self) return { 0.0, 0.0, 0.0 };
 
     SDK::FVector v = { 0.0, 0.0, 0.0 };
-    if (IsUsableObject(self->TurretComponent))
-        v = self->TurretComponent->GetSuspensionAdjustedMuzzleTransform().Translation;
 
-    if (v.IsZero())
+    SDK::FName socket = GunSocketName;
+    if (IsUsableObject(self->ShellFiringComponent))
     {
-        SDK::FName socket = GunSocketName;
-        if (IsUsableObject(self->ShellFiringComponent))
+        if (!self->ShellFiringComponent->BulletOriginSocket.IsNone())
         {
-            if (!self->ShellFiringComponent->BulletOriginSocket.IsNone())
-                socket = self->ShellFiringComponent->BulletOriginSocket;
-            else if (!self->ShellFiringComponent->GunSocket.IsNone())
-                socket = self->ShellFiringComponent->GunSocket;
+            socket = self->ShellFiringComponent->BulletOriginSocket;
         }
-        if (IsUsableObject(self->VisualMesh) && !socket.IsNone())
-            v = self->VisualMesh->GetSocketLocation(socket);
+        else if (!self->ShellFiringComponent->GunSocket.IsNone())
+        {
+            socket = self->ShellFiringComponent->GunSocket;
+        }
+    }
+
+    if (IsUsableObject(self->VisualMesh) && !socket.IsNone())
+    {
+        v = self->VisualMesh->GetSocketLocation(socket);
+    }
+
+    if (v.IsZero() && IsUsableObject(self->TurretComponent))
+    {
+        v = self->TurretComponent->GetSuspensionAdjustedMuzzleTransform().Translation;
     }
 
     if (v.IsZero())
@@ -1333,6 +1431,63 @@ static bool TryGetViewportCenterScreenPosition(SDK::APlayerController* playerCon
     return true;
 }
 
+static bool TryProjectWorldLocationToReasonableScreenPosition(
+    SDK::APlayerController* playerController,
+    const SDK::FVector& worldLocation,
+    SDK::FVector2D* outScreenPosition)
+{
+    if (!playerController || !outScreenPosition || worldLocation.IsZero())
+    {
+        return false;
+    }
+
+    SDK::FVector2D screenPosition{};
+    if (!playerController->ProjectWorldLocationToScreen(worldLocation, &screenPosition, true))
+    {
+        return false;
+    }
+
+    if (!IsReasonableScreenPosition(playerController, screenPosition))
+    {
+        return false;
+    }
+
+    *outScreenPosition = screenPosition;
+    return true;
+}
+
+static bool TryGetCameraTargetLocationWorld(
+    SDK::APlayerController* playerController,
+    SDK::ABP_BaseTank_C* self,
+    SDK::FVector* outWorldLocation)
+{
+    if (!playerController || !outWorldLocation || !IsUsableTank(self) || !IsUsableObject(playerController->PlayerCameraManager))
+    {
+        return false;
+    }
+
+    SDK::UWorld* const world = GetWorld();
+    if (!world)
+    {
+        return false;
+    }
+
+    *outWorldLocation = SDK::FVector{};
+    double targetDistance = 0.0;
+    SDK::UTyrGameplayFunctionLibrary::GetCameraTargetLocation(
+        world,
+        self,
+        playerController->PlayerCameraManager,
+        0.0,
+        false,
+        true,
+        true,
+        outWorldLocation,
+        &targetDistance,
+        0.0f);
+    return !outWorldLocation->IsZero();
+}
+
 static bool TryGetReticleWidgetFocusScreenPosition(
     SDK::APlayerController* playerController,
     SDK::FVector2D* outScreenPosition)
@@ -1385,41 +1540,17 @@ static bool TryGetCameraTargetFocusScreenPosition(
     SDK::ABP_BaseTank_C* self,
     SDK::FVector2D* outScreenPosition)
 {
-    if (!playerController || !outScreenPosition || !IsUsableTank(self) || !IsUsableObject(playerController->PlayerCameraManager))
-    {
-        return false;
-    }
-
-    SDK::UWorld* const world = GetWorld();
-    if (!world)
+    if (!playerController || !outScreenPosition)
     {
         return false;
     }
 
     SDK::FVector cameraTargetLocation{};
-    double targetDistance = 0.0;
-    SDK::UTyrGameplayFunctionLibrary::GetCameraTargetLocation(
-        world,
-        self,
-        playerController->PlayerCameraManager,
-        0.0,
-        false,
-        true,
-        true,
-        &cameraTargetLocation,
-        &targetDistance,
-        0.0f);
-    if (cameraTargetLocation.IsZero())
+    if (!TryGetCameraTargetLocationWorld(playerController, self, &cameraTargetLocation))
     {
         return false;
     }
-
-    if (!playerController->ProjectWorldLocationToScreen(cameraTargetLocation, outScreenPosition, true))
-    {
-        return false;
-    }
-
-    return IsReasonableScreenPosition(playerController, *outScreenPosition);
+    return TryProjectWorldLocationToReasonableScreenPosition(playerController, cameraTargetLocation, outScreenPosition);
 }
 
 static bool TryGetFocusScreenPosition(
@@ -1432,7 +1563,16 @@ static bool TryGetFocusScreenPosition(
         return false;
     }
 
-    (void)self;
+    if (TryGetReticleWidgetFocusScreenPosition(playerController, outScreenPosition))
+    {
+        return true;
+    }
+
+    if (TryGetCameraTargetFocusScreenPosition(playerController, self, outScreenPosition))
+    {
+        return true;
+    }
+
     return TryGetViewportCenterScreenPosition(playerController, outScreenPosition);
 }
 
@@ -1555,6 +1695,274 @@ static float ClampFloat(float value, float minValue, float maxValue)
     }
 
     return value;
+}
+
+static bool TryGetCurrentShellBallistics(
+    SDK::UWorld* world,
+    SDK::ABP_BaseTank_C* self,
+    SDK::ATyrPlayerStateBase* selfPlayerState,
+    float* outShellSpeed,
+    float* outGravityZ)
+{
+    if (!world || !IsUsableTank(self) || !outShellSpeed || !outGravityZ)
+    {
+        return false;
+    }
+
+    *outShellSpeed = self->GetShellVelocity();
+    if (*outShellSpeed <= 0.001f &&
+        IsUsableObject(selfPlayerState) &&
+        IsUsableObject(selfPlayerState->VehicleStatsAttribute))
+    {
+        *outShellSpeed = selfPlayerState->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+        if (*outShellSpeed <= 0.001f)
+        {
+            *outShellSpeed = selfPlayerState->VehicleStatsAttribute->ShellVelocity.BaseValue;
+        }
+    }
+
+    auto* const worldSettings = world->K2_GetWorldSettings();
+    *outGravityZ = worldSettings ? worldSettings->GlobalGravityZ : -980.0f;
+
+    SDK::UProjectileMovementComponent* projectileMovement = nullptr;
+    if (TryGetActiveProjectileMovementComponent(self, &projectileMovement) && projectileMovement)
+    {
+        *outGravityZ *= projectileMovement->ProjectileGravityScale;
+    }
+
+    return *outShellSpeed > 0.001f;
+}
+
+static bool TryGetRangefinderReferencePoint(
+    SDK::UWorld* world,
+    SDK::APlayerController* playerController,
+    SDK::ABP_BaseTank_C* self,
+    const SDK::FVector& cameraLocation,
+    const SDK::FRotator& cameraRotation,
+    SDK::FVector* outReferencePoint)
+{
+    if (!world || !playerController || !IsUsableTank(self) || !outReferencePoint)
+    {
+        return false;
+    }
+
+    *outReferencePoint = SDK::FVector{};
+
+    SDK::FVector aimRayOrigin = cameraLocation;
+    SDK::FVector aimRayDirection = UKismetMathLibrary::GetForwardVector(cameraRotation);
+    TryNormalizeVector(aimRayDirection, &aimRayDirection);
+    if (TryGetPreciseAimWorldRay(
+        playerController,
+        self,
+        cameraLocation,
+        cameraRotation,
+        &aimRayOrigin,
+        &aimRayDirection))
+    {
+        if (aimRayOrigin.IsZero())
+        {
+            aimRayOrigin = cameraLocation;
+        }
+    }
+
+    const SDK::FVector traceEnd = aimRayOrigin + (aimRayDirection * 1000000.0f);
+    SDK::TArray<SDK::FHitResult> hitResults;
+    bool bAnyHit = false;
+    UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
+        self,
+        aimRayOrigin,
+        traceEnd,
+        ETraceTypeQuery::TraceTypeQuery1,
+        world,
+        &hitResults,
+        &bAnyHit);
+
+    SDK::FHitResult firstBlockingHit{};
+    if (!bAnyHit || !TryGetFirstBlockingHit(hitResults, &firstBlockingHit))
+    {
+        SDK::FVector cameraTargetLocation{};
+        if (TryGetCameraTargetLocationWorld(playerController, self, &cameraTargetLocation))
+        {
+            *outReferencePoint = cameraTargetLocation;
+            return true;
+        }
+
+        *outReferencePoint = traceEnd;
+        return !outReferencePoint->IsZero();
+    }
+
+    return TryResolveAimPointFromHit(firstBlockingHit, outReferencePoint);
+}
+
+static SDK::FVector GetBallisticPointAtTime(
+    const SDK::FVector& fireOrigin,
+    const SDK::FVector& launchDirection,
+    float shellSpeed,
+    float gravityZ,
+    float timeSeconds)
+{
+    return fireOrigin +
+        (launchDirection * static_cast<double>(shellSpeed * timeSeconds)) +
+        SDK::FVector{ 0.0, 0.0, 0.5 * static_cast<double>(gravityZ) * timeSeconds * timeSeconds };
+}
+
+static bool TryGetRangefinderImpactPoint(
+    SDK::UWorld* world,
+    SDK::ABP_BaseTank_C* self,
+    const SDK::FVector& fireOrigin,
+    const SDK::FVector& referencePoint,
+    float shellSpeed,
+    float gravityZ,
+    SDK::FVector* outImpactPoint)
+{
+    if (!world || !IsUsableTank(self) || fireOrigin.IsZero() || referencePoint.IsZero() || shellSpeed <= 0.001f || !outImpactPoint)
+    {
+        return false;
+    }
+
+    *outImpactPoint = referencePoint;
+
+    SDK::FVector launchDirection{};
+    if (!TryMakeNormalizedDirection(fireOrigin, referencePoint, &launchDirection))
+    {
+        return false;
+    }
+
+    const float referenceDistance = static_cast<float>(fireOrigin.GetDistanceTo(referencePoint));
+    if (referenceDistance <= 0.001f)
+    {
+        *outImpactPoint = referencePoint;
+        return true;
+    }
+
+    const float referenceTime = referenceDistance / shellSpeed;
+    const float extraSimulationTime = (referenceTime * 0.35f) > 0.35f ? (referenceTime * 0.35f) : 0.35f;
+    const float maxSimulationTime = ClampFloat(referenceTime + extraSimulationTime, 0.05f, 8.0f);
+    int32 simulationStepCount = static_cast<int32>(std::ceil(maxSimulationTime / 0.05f));
+    if (simulationStepCount < 12)
+    {
+        simulationStepCount = 12;
+    }
+    else if (simulationStepCount > 48)
+    {
+        simulationStepCount = 48;
+    }
+
+    SDK::FVector previousPoint = fireOrigin;
+    for (int32 stepIndex = 1; stepIndex <= simulationStepCount; ++stepIndex)
+    {
+        const float timeSeconds = (maxSimulationTime * static_cast<float>(stepIndex)) / static_cast<float>(simulationStepCount);
+        const SDK::FVector currentPoint = GetBallisticPointAtTime(
+            fireOrigin,
+            launchDirection,
+            shellSpeed,
+            gravityZ,
+            timeSeconds);
+
+        SDK::TArray<SDK::FHitResult> hitResults;
+        bool bAnyHit = false;
+        UBPFL_VehicleUtils_C::LineTraceAllHitsFromVehicle(
+            self,
+            previousPoint,
+            currentPoint,
+            ETraceTypeQuery::TraceTypeQuery1,
+            world,
+            &hitResults,
+            &bAnyHit);
+
+        SDK::FHitResult firstBlockingHit{};
+        if (bAnyHit && TryGetFirstBlockingHit(hitResults, &firstBlockingHit) && TryResolveAimPointFromHit(firstBlockingHit, outImpactPoint))
+        {
+            return true;
+        }
+
+        previousPoint = currentPoint;
+        *outImpactPoint = currentPoint;
+    }
+
+    return true;
+}
+
+static void DrawRangefinderIndicator(
+    SDK::UCanvas* canvas,
+    SDK::UWorld* world,
+    SDK::APlayerController* playerController,
+    SDK::ABP_BaseTank_C* self,
+    SDK::ATyrPlayerStateBase* selfPlayerState)
+{
+    if (!canvas || !world || !playerController || !IsUsableTank(self))
+    {
+        return;
+    }
+
+    SDK::FVector cameraLocation{};
+    SDK::FRotator cameraRotation{};
+    if (!TryGetFrameViewPoint(playerController, &cameraLocation, &cameraRotation))
+    {
+        return;
+    }
+
+    float shellSpeed = 0.0f;
+    float gravityZ = -980.0f;
+    if (!TryGetCurrentShellBallistics(world, self, selfPlayerState, &shellSpeed, &gravityZ))
+    {
+        return;
+    }
+
+    SDK::FVector referencePoint{};
+    if (!TryGetRangefinderReferencePoint(world, playerController, self, cameraLocation, cameraRotation, &referencePoint))
+    {
+        return;
+    }
+
+    const SDK::FVector fireOrigin = GetFireOrigin(self);
+    if (fireOrigin.IsZero())
+    {
+        return;
+    }
+
+    SDK::FVector impactPoint{};
+    if (!TryGetRangefinderImpactPoint(world, self, fireOrigin, referencePoint, shellSpeed, gravityZ, &impactPoint))
+    {
+        return;
+    }
+
+    SDK::FVector2D anchorScreenPosition{};
+    if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, referencePoint, &anchorScreenPosition) &&
+        !TryGetReticleWidgetFocusScreenPosition(playerController, &anchorScreenPosition) &&
+        !TryGetCameraTargetFocusScreenPosition(playerController, self, &anchorScreenPosition) &&
+        !TryGetFocusScreenPosition(playerController, self, &anchorScreenPosition))
+    {
+        return;
+    }
+
+    int viewportWidth = 0;
+    int viewportHeight = 0;
+    playerController->GetViewportSize(&viewportWidth, &viewportHeight);
+    if (viewportWidth <= 0 || viewportHeight <= 0)
+    {
+        return;
+    }
+
+    SDK::FVector2D impactScreenPosition{};
+    if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, impactPoint, &impactScreenPosition))
+    {
+        return;
+    }
+
+    SDK::FVector2D drawPosition{};
+    drawPosition.X = ClampFloat(static_cast<float>(impactScreenPosition.X), 8.0f, static_cast<float>(viewportWidth) - 8.0f);
+    const float minimumIndicatorY = ClampFloat(
+        static_cast<float>(anchorScreenPosition.Y) + 12.0f,
+        8.0f,
+        static_cast<float>(viewportHeight) - 8.0f);
+    drawPosition.Y = ClampFloat(
+        static_cast<float>(impactScreenPosition.Y),
+        minimumIndicatorY,
+        static_cast<float>(viewportHeight) - 8.0f);
+
+    DrawFilledCircle(drawPosition, 4.5f, FLinearColors::SlateBlue, nullptr, canvas);
+    DrawCircle(drawPosition, 6.0f, 24, FLinearColors::White, nullptr, canvas);
 }
 
 static SDK::FRotator SmoothRotationTowards(
@@ -1774,7 +2182,7 @@ static bool TryGetTargetAcquireScreenPosition(
     if (!IsUsableObject(boundsComponent))
     {
         const SDK::FVector actorLocation = tank->K2_GetActorLocation();
-        return !actorLocation.IsZero() && playerController->ProjectWorldLocationToScreen(actorLocation, outScreenPosition, true);
+        return TryProjectWorldLocationToReasonableScreenPosition(playerController, actorLocation, outScreenPosition);
     }
 
     SDK::FVector boundsOrigin{};
@@ -1784,7 +2192,7 @@ static bool TryGetTargetAcquireScreenPosition(
     if (boundsOrigin.IsZero() && boundsExtent.IsZero())
     {
         const SDK::FVector actorLocation = tank->K2_GetActorLocation();
-        return !actorLocation.IsZero() && playerController->ProjectWorldLocationToScreen(actorLocation, outScreenPosition, true);
+        return TryProjectWorldLocationToReasonableScreenPosition(playerController, actorLocation, outScreenPosition);
     }
 
     const SDK::FVector corners[8] =
@@ -1808,7 +2216,7 @@ static bool TryGetTargetAcquireScreenPosition(
     for (const SDK::FVector& corner : corners)
     {
         SDK::FVector2D projectedCorner{};
-        if (!playerController->ProjectWorldLocationToScreen(corner, &projectedCorner, true))
+        if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, corner, &projectedCorner))
         {
             continue;
         }
@@ -1823,7 +2231,7 @@ static bool TryGetTargetAcquireScreenPosition(
     if (!bAnyCornerProjected || minX > maxX || minY > maxY)
     {
         const SDK::FVector actorLocation = tank->K2_GetActorLocation();
-        return !actorLocation.IsZero() && playerController->ProjectWorldLocationToScreen(actorLocation, outScreenPosition, true);
+        return TryProjectWorldLocationToReasonableScreenPosition(playerController, actorLocation, outScreenPosition);
     }
 
     SDK::FVector2D focusScreenPosition{};
@@ -1958,7 +2366,7 @@ static bool TryEvaluateDirectCrosshairSelection(
     }
 
     SDK::FVector2D candidateScreenPosition{};
-    if (!playerController->ProjectWorldLocationToScreen(ballisticAimPoint, &candidateScreenPosition, true))
+    if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, ballisticAimPoint, &candidateScreenPosition))
     {
         return false;
     }
@@ -2010,6 +2418,7 @@ static bool TryEvaluateDirectCrosshairSelection(
     candidate.EffectiveThickness = surfaceAssessment.EffectiveThickness;
     candidate.ArmorThickness = surfaceAssessment.ArmorThickness;
     candidate.PenetrationTier = surfaceAssessment.PenetrationTier;
+    candidate.HasModuleHit = !surfaceAssessment.ModuleName.IsNone();
     candidate.HasCandidate = true;
 
     *outEvaluation = candidate;
@@ -2061,7 +2470,19 @@ static bool TryEvaluateLockedTargetSelection(
 
     FHitResult targetArmorHit{};
     FVector candidateAimPoint{};
-    if (!TryGetVisibleTargetHitForBone(world, self, target, cameraLoc, fireOrigin, lockedBoneWorldLoc, &targetArmorHit, &candidateAimPoint))
+    SDK::USkeletalMeshComponent* visibleProbeComponent = nullptr;
+    SDK::FName visibleProbeBoneName{};
+    if (!TryGetVisibleTargetHitForBone(
+            world,
+            self,
+            target,
+            cameraLoc,
+            fireOrigin,
+            lockedBoneWorldLoc,
+            &targetArmorHit,
+            &candidateAimPoint,
+            &visibleProbeComponent,
+            &visibleProbeBoneName))
     {
         return false;
     }
@@ -2082,7 +2503,7 @@ static bool TryEvaluateLockedTargetSelection(
     }
 
     SDK::FVector2D candidateScreenPosition{};
-    if (!playerController->ProjectWorldLocationToScreen(candidateAimPoint, &candidateScreenPosition, true))
+    if (!TryProjectWorldLocationToReasonableScreenPosition(playerController, candidateAimPoint, &candidateScreenPosition))
     {
         return false;
     }
@@ -2097,8 +2518,14 @@ static bool TryEvaluateLockedTargetSelection(
     candidate.Target = target;
     candidate.AimComponent = targetArmorHit.Component.Get();
     candidate.AimBoneName = targetArmorHit.BoneName;
-    candidate.ProbeComponent = lockedProbeComponent;
-    candidate.ProbeBoneName = lockedProbeBoneName;
+    candidate.ProbeComponent =
+        IsUsableObject(visibleProbeComponent) && !visibleProbeBoneName.IsNone()
+        ? visibleProbeComponent
+        : lockedProbeComponent;
+    candidate.ProbeBoneName =
+        IsUsableObject(visibleProbeComponent) && !visibleProbeBoneName.IsNone()
+        ? visibleProbeBoneName
+        : lockedProbeBoneName;
     candidate.AimPoint = candidateAimPoint;
     candidate.FirstHitLabel = BuildFirstHitClassificationLabel(surfaceAssessment.ModuleName, surfaceAssessment.ArmorName, targetArmorHit) +
         " pen=" + GetPenetrationTierLabel(surfaceAssessment.PenetrationTier);
@@ -2107,19 +2534,106 @@ static bool TryEvaluateLockedTargetSelection(
     candidate.EffectiveThickness = surfaceAssessment.EffectiveThickness;
     candidate.ArmorThickness = surfaceAssessment.ArmorThickness;
     candidate.PenetrationTier = surfaceAssessment.PenetrationTier;
+    candidate.HasModuleHit = !surfaceAssessment.ModuleName.IsNone();
     candidate.HasCandidate = true;
 
     *outEvaluation = candidate;
     return true;
 }
 
+static SDK::ABP_BaseTank_C* GetActiveAutoLockTarget(SDK::ABP_BaseTank_C* self)
+{
+    if (!IsUsableTank(self) || !IsUsableObject(self->TurretComponent))
+    {
+        return nullptr;
+    }
+
+    auto* const resolvedActor =
+        ResolveRelatedActorOfClass(static_cast<SDK::AActor*>(self->TurretComponent->AutoLockTarget), SDK::ABP_BaseTank_C::StaticClass());
+    auto* const resolvedTank = resolvedActor ? static_cast<SDK::ABP_BaseTank_C*>(resolvedActor) : nullptr;
+    return IsUsableTank(resolvedTank) ? resolvedTank : nullptr;
+}
+
+static SDK::FName SelectAutoLockSocketName(const TargetWeakpointEvaluation& selection);
+
+static bool DoesCurrentAutoLockMatchSelection(SDK::ABP_BaseTank_C* self, const TargetWeakpointEvaluation& selection)
+{
+    if (!IsUsableTank(self) ||
+        !selection.HasCandidate ||
+        !IsUsableTank(selection.Target) ||
+        !IsUsableObject(self->TurretComponent) ||
+        !self->TurretComponent->IsA(SDK::UBPC_TurretBaseComponent_C::StaticClass()))
+    {
+        return false;
+    }
+
+    auto* const currentAutoLockTarget = GetActiveAutoLockTarget(self);
+    if (currentAutoLockTarget != selection.Target)
+    {
+        return false;
+    }
+
+    auto* const turretComponent = static_cast<SDK::UBPC_TurretBaseComponent_C*>(self->TurretComponent);
+    return turretComponent->AutoLockSocketname == SelectAutoLockSocketName(selection);
+}
+
+static SDK::FName SelectAutoLockSocketName(const TargetWeakpointEvaluation& selection)
+{
+    if (!selection.ProbeBoneName.IsNone())
+    {
+        return selection.ProbeBoneName;
+    }
+
+    if (!selection.AimBoneName.IsNone())
+    {
+        return selection.AimBoneName;
+    }
+
+    return SDK::FName{};
+}
+
+static void ClearSdkAutoLock(SDK::ABP_BaseTank_C* self)
+{
+    if (!IsUsableTank(self) ||
+        !IsUsableObject(self->TurretComponent) ||
+        !self->TurretComponent->IsA(SDK::UBPC_TurretBaseComponent_C::StaticClass()))
+    {
+        return;
+    }
+
+    auto* const turretComponent = static_cast<SDK::UBPC_TurretBaseComponent_C*>(self->TurretComponent);
+    turretComponent->AutoLockSocketname = SDK::FName{};
+    turretComponent->AutoLockTarget = nullptr;
+    turretComponent->OnRep_AutoLockTarget();
+    turretComponent->DisableAutoLockOnAuthority();
+}
+
+static void ApplySdkAutoLock(SDK::ABP_BaseTank_C* self, const TargetWeakpointEvaluation& selection)
+{
+    if (!IsUsableTank(self) ||
+        !selection.HasCandidate ||
+        !IsUsableTank(selection.Target) ||
+        !IsUsableObject(self->TurretComponent) ||
+        !self->TurretComponent->IsA(SDK::UBPC_TurretBaseComponent_C::StaticClass()))
+    {
+        return;
+    }
+
+    auto* const turretComponent = static_cast<SDK::UBPC_TurretBaseComponent_C*>(self->TurretComponent);
+    turretComponent->AutoLockSocketname = SelectAutoLockSocketName(selection);
+    turretComponent->AutoLockTarget = selection.Target;
+    turretComponent->OnRep_AutoLockTarget();
+    turretComponent->Server_SetAutoLockTarget(selection.Target);
+}
+
 void Aimbot::Loop(SDK::UCanvas* Canvas)
 {
+    const bool drawRangefinderIndicator = IsRangefinderKeyDown();
     const bool drawAimTracers =
         EmpireFeatures::Get(EmpireFeatures::AimbotEnabled) &&
         EmpireFeatures::Get(EmpireFeatures::AimbotTracers);
     const bool drawAimedAtWarning = EmpireFeatures::Get(EmpireFeatures::AimedAtWarning);
-    if (!drawAimTracers && !drawAimedAtWarning)
+    if (!drawAimTracers && !drawAimedAtWarning && !drawRangefinderIndicator)
     {
         return;
     }
@@ -2138,6 +2652,16 @@ void Aimbot::Loop(SDK::UCanvas* Canvas)
     auto tyr = GetTyrGameActionMessageStatics();
     auto self_ps = IsUsableTank(self) ? tyr.GetTyrPlayerStateFromObject(self) : nullptr;
     int threateningEnemyCount = 0;
+
+    if (drawRangefinderIndicator && IsUsableTank(self))
+    {
+        DrawRangefinderIndicator(Canvas, World, PlayerController, self, self_ps);
+    }
+
+    if (!drawAimTracers && !drawAimedAtWarning)
+    {
+        return;
+    }
 
     TArray<AActor*> Actors;
     SDK::UGameplayStatics::GetAllActorsOfClass(World, SDK::ABP_BaseTank_C::StaticClass(), &Actors);
@@ -2209,10 +2733,14 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
     APlayerController* player_controller = GetPlayerController();
     ABP_BaseTank_C* self = GetSelf();
+    bool autoLockKeyDown = false;
+    bool autoLockJustPressed = false;
+    SampleAutoLockKeyState(&autoLockKeyDown, &autoLockJustPressed);
+    const bool aimKeyDown = IsAimKeyDown();
 
     DrawAimFovCircle(ViewportClient, Canvas, player_controller, IsUsableTank(self) ? self : nullptr);
 
-    if (IsAimKeyDown())
+    if (aimKeyDown || autoLockKeyDown)
     {
         if (player_controller)
         {
@@ -2223,6 +2751,7 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
             auto tyr = GetTyrGameActionMessageStatics();
             auto self_ps = tyr.GetTyrPlayerStateFromObject(self);
+            auto* const currentAutoLockTarget = GetActiveAutoLockTarget(self);
 
             if (!IsUsableTank(Target) || !IsUsableObject(Target->VisualMesh))
             {
@@ -2579,6 +3108,11 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
             if (!bestSelection.HasCandidate || !IsUsableTank(bestSelection.Target))
             {
+                if (autoLockJustPressed && IsUsableTank(currentAutoLockTarget))
+                {
+                    ClearSdkAutoLock(self);
+                }
+
                 const ULONGLONG nowTick = GetTickCount64();
                 const bool canHoldPreviousSelectionGrace =
                     IsUsableTank(previousTarget) &&
@@ -2611,7 +3145,19 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                 DebugPrint("[Aim] SELECTED first-hit target: %s | %s | aim-bone=%s", Target->GetName().c_str(), bestSelection.FirstHitLabel.c_str(), LockedBoneName.ToString().c_str());
             }
 
-            if (!best_aim_point.IsZero())
+            if (autoLockJustPressed)
+            {
+                if (DoesCurrentAutoLockMatchSelection(self, bestSelection))
+                {
+                    ClearSdkAutoLock(self);
+                }
+                else
+                {
+                    ApplySdkAutoLock(self, bestSelection);
+                }
+            }
+
+            if (aimKeyDown && !best_aim_point.IsZero())
             {
                 auto worldsettings = world->K2_GetWorldSettings();
                 float WorldGravityZ = worldsettings ? worldsettings->GlobalGravityZ : -980.f;

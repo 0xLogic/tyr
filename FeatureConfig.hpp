@@ -12,6 +12,9 @@ namespace EmpireFeatures
     inline std::atomic_bool ShotOriginIndicators{ true };
     inline std::atomic_bool ShellTrajectoryIndicators{ true };
     inline std::atomic_bool ArmorVisualization{ true };
+    inline std::atomic_bool VegetationOptimization{ true };
+    inline std::atomic_bool AtmosphereEffectMitigation{ true };
+    inline std::atomic_bool CamouflageMitigation{ true };
     inline std::atomic_bool AimedAtWarning{ true };
 
     inline std::atomic_bool WeaponMods{ true };
