@@ -772,6 +772,15 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                         float current_distance = (float)fire_origin.GetDistanceTo(bone_world_loc);
                         if (self_pen < armor_thickness) break;
 
+                        // Skip explicitly-high bones (cupola, turret roof, hatch).
+                        // Without this we tend to pick the highest bone on the
+                        // model because thin armor often lives on the cupola/hatch,
+                        // and the shot lands "over" the target.
+                        if (boneNameStr.find("cupola") != std::string::npos) break;
+                        if (boneNameStr.find("hatch") != std::string::npos) break;
+                        if (boneNameStr.find("roof") != std::string::npos) break;
+                        if (boneNameStr.find("top") != std::string::npos) break;
+
                         const bool is_module = boneNameStr.find("thruster") != std::string::npos
                             || boneNameStr.find("engine") != std::string::npos;
                         if (is_module)
@@ -820,19 +829,29 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
         return;
     }
 
-    // Pull bullet speed + target velocity. Lead-only prediction (no drop).
     auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
     if (!ps || !ps->VehicleStatsAttribute) return;
-    // ShellVelocity attribute is authored in m/s, but Unreal world coordinates
-    // are in cm. The firing BP multiplies by 100 before passing to the
-    // projectile spawn (GA_MainWeapon_Fire's Multiply_DoubleDouble step), so
-    // we have to do the same here or our time-of-flight is 100x too large
-    // and we over-lead by 100x.
-    const float b_speed_raw = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
-    const float b_speed = b_speed_raw * 100.0f;
+
+    // ShellVelocity is already in cm/s. The firing BP's Multiply_DoubleDouble
+    // step has no second operand stored — it's a 1.0 type-widening pass-through,
+    // not a unit conversion. Use the raw value.
+    const float b_speed = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
     const SDK::FVector TargetVelocity = Mouse4Target->GetVelocity();
     const float distance = (float)fire_origin.GetDistanceTo(best_bone_loc);
-    const SDK::FVector predicted_loc = PredictLead(best_bone_loc, TargetVelocity, distance, b_speed);
+
+    // Lead + small gravity drop. Tyr's UTyrProjectileMovementComponent inherits
+    // UE's default ProjectileGravityScale (1.0f) unless the projectile BP
+    // overrides it. The user reports "slightest drop" — consistent with a
+    // small fixed scale. Tunable here until we read the live value.
+    static float kProjectileGravityScale = 0.10f;
+    auto* world_settings = SDK::UWorld::GetWorld()->K2_GetWorldSettings();
+    const float world_grav = world_settings ? world_settings->GlobalGravityZ : -980.0f;
+    const float grav_abs = world_grav < 0 ? -world_grav : world_grav;
+    const float tof = (b_speed > 0.001f) ? (distance / b_speed) : 0.0f;
+    const float drop_z = 0.5f * grav_abs * kProjectileGravityScale * tof * tof;
+
+    SDK::FVector predicted_loc = best_bone_loc + (TargetVelocity * tof);
+    predicted_loc.Z += drop_z;
 
     SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
 
@@ -853,7 +872,11 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 
     player_controller->SetControlRotation(applied_rotation);
 
-    if (self->TurretComponent && !bIsInSniper)
+    // Drive the turret with the LEAD target unconditionally — previously this
+    // was skipped in sniper mode, which meant the camera moved with the lead
+    // but the gun barrel stayed put (the actual cause of "no visible
+    // prediction" once the 100x scaling issue was untangled).
+    if (self->TurretComponent)
     {
         self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
     }
@@ -903,11 +926,13 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
             L" deg  N=" + FormatVectorWide(susp));
     }
 
-    const double tof = (b_speed > 0.001f) ? (double)distance / (double)b_speed : 0.0;
-    draw(std::wstring(L"Ballistic: bSpdRaw=") + FormatDoubleWide(b_speed_raw, 1) +
-        L"  bSpdUsed=" + FormatDoubleWide(b_speed, 0) +
+    draw(std::wstring(L"Ballistic: bSpd=") + FormatDoubleWide(b_speed, 1) +
         L"  ToF=" + FormatDoubleWide(tof, 3) +
-        L"  slantDist=" + FormatDoubleWide(distance, 0));
+        L"  slantDist=" + FormatDoubleWide(distance, 0) +
+        L"  dropZ=" + FormatSignedDoubleWide(drop_z, 1) +
+        L"  gScale=" + FormatDoubleWide(kProjectileGravityScale, 3));
+    draw(std::wstring(L"TgtVelMag: ") + FormatDoubleWide((double)TargetVelocity.Magnitude(), 1) +
+        L"  LeadXY=" + FormatVectorWide(SDK::FVector{ TargetVelocity.X * tof, TargetVelocity.Y * tof, TargetVelocity.Z * tof }));
     draw(std::wstring(L"CtrlRot: ") + FormatRotatorWide(current_control_rotation));
     draw(std::wstring(L"AimRot: ") + FormatRotatorWide(target_rotation));
     if (bIsZoomed)
