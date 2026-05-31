@@ -1506,7 +1506,7 @@ namespace safetyhook {
 
     UnprotectMemory::~UnprotectMemory() {
         if (m_address != nullptr) {
-            vm_protect(m_address, m_size, m_original_protection);
+            (void)vm_protect(m_address, m_size, m_original_protection);
         }
     }
 

@@ -2,7 +2,7 @@
 
 #include "SDK.hpp"
 
-#define PI (3.14159265358979323846264338327950288419716939937510)
+#define PI (3.14159265358979323846f)
 #define ISVALID(ObjectRef) \
 (ObjectRef && SDK::UKismetSystemLibrary::IsValid(ObjectRef))
 
@@ -31,9 +31,9 @@ SDK::UFont* get_roboto();
 bool IsValidScreenLoc(const SDK::FVector2D& Loc);
 bool IsValidScreenLoc(const SDK::FVector& Loc);
 void DrawFilledCircle(SDK::FVector2D pos, float r, SDK::FLinearColor color, SDK::UGameViewportClient* ViewportClient, SDK::UCanvas* Canvas);
-void DrawCircle(SDK::FVector2D pos, int radius, int numSides, SDK::FLinearColor Color, SDK::UGameViewportClient* ViewportClient, SDK::UCanvas* Canvas);
-void DrawLine(SDK::UCanvas* Canvas, int x, int y, int xx, int yy, const SDK::FLinearColor& RenderColor, int thicknes);
-void CornerBox(SDK::UCanvas* Canvas, int x, int y, int w, int h, int thickness, const SDK::FLinearColor& color);
+void DrawCircle(SDK::FVector2D pos, float radius, int numSides, SDK::FLinearColor Color, SDK::UGameViewportClient* ViewportClient, SDK::UCanvas* Canvas);
+void DrawLine(SDK::UCanvas* Canvas, float x, float y, float xx, float yy, const SDK::FLinearColor& RenderColor, float thicknes);
+void CornerBox(SDK::UCanvas* Canvas, float x, float y, float w, float h, float thickness, const SDK::FLinearColor& color);
 void DrawPlayerBounds(SDK::UCanvas* Canvas, SDK::APlayerController* PlayerController, SDK::ABP_BaseTank_C* Tank, const SDK::FLinearColor& color, int thickness);
 void Loop(SDK::UCanvas* Canvas);
 
@@ -47,6 +47,159 @@ static __forceinline SDK::UWidgetBlueprintLibrary& GetWidgetBlueprintLibrary() {
 static __forceinline SDK::UKismetMaterialLibrary& GetKismetMaterialLibrary() { return *(SDK::UKismetMaterialLibrary*)SDK::UKismetMaterialLibrary::StaticClass(); };
 static __forceinline SDK::UKismetRenderingLibrary& GetKismetRenderingLibrary() { return *(SDK::UKismetRenderingLibrary*)SDK::UKismetRenderingLibrary::StaticClass(); };
 static __forceinline SDK::UKismetStringLibrary& GetUKismetStringLibrary() { return *(SDK::UKismetStringLibrary*)SDK::UKismetStringLibrary::StaticClass(); };
+
+// Strict LOS helpers: only the first blocking hit is authoritative.
+static __forceinline bool TryGetFirstBlockingHit(const SDK::TArray<SDK::FHitResult>& HitResults, SDK::FHitResult* OutHit)
+{
+    if (!OutHit)
+    {
+        return false;
+    }
+
+    for (const SDK::FHitResult& HitResult : HitResults)
+    {
+        if (HitResult.bBlockingHit)
+        {
+            *OutHit = HitResult;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static __forceinline bool DoesActorMatchExpectedOwnerHierarchy(
+    SDK::AActor* CandidateActor,
+    SDK::AActor* ExpectedOwner)
+{
+    if (!CandidateActor || !ExpectedOwner)
+    {
+        return false;
+    }
+
+    SDK::AActor* firstLevelActors[] =
+    {
+        CandidateActor,
+        CandidateActor->GetOwner(),
+        CandidateActor->GetParentActor(),
+        CandidateActor->GetAttachParentActor(),
+    };
+
+    for (SDK::AActor* actor : firstLevelActors)
+    {
+        if (actor == ExpectedOwner)
+        {
+            return true;
+        }
+    }
+
+    for (SDK::AActor* actor : firstLevelActors)
+    {
+        if (!actor)
+        {
+            continue;
+        }
+
+        SDK::AActor* secondLevelActors[] =
+        {
+            actor->GetOwner(),
+            actor->GetParentActor(),
+            actor->GetAttachParentActor(),
+        };
+
+        for (SDK::AActor* secondLevelActor : secondLevelActors)
+        {
+            if (secondLevelActor == ExpectedOwner)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static __forceinline SDK::AActor* ResolveRelatedActorOfClass(
+    SDK::AActor* CandidateActor,
+    SDK::UClass* ExpectedClass)
+{
+    if (!CandidateActor || !ExpectedClass)
+    {
+        return nullptr;
+    }
+
+    SDK::AActor* firstLevelActors[] =
+    {
+        CandidateActor,
+        CandidateActor->GetOwner(),
+        CandidateActor->GetParentActor(),
+        CandidateActor->GetAttachParentActor(),
+    };
+
+    for (SDK::AActor* actor : firstLevelActors)
+    {
+        if (actor && actor->IsA(ExpectedClass))
+        {
+            return actor;
+        }
+    }
+
+    for (SDK::AActor* actor : firstLevelActors)
+    {
+        if (!actor)
+        {
+            continue;
+        }
+
+        SDK::AActor* secondLevelActors[] =
+        {
+            actor->GetOwner(),
+            actor->GetParentActor(),
+            actor->GetAttachParentActor(),
+        };
+
+        for (SDK::AActor* secondLevelActor : secondLevelActors)
+        {
+            if (secondLevelActor && secondLevelActor->IsA(ExpectedClass))
+            {
+                return secondLevelActor;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+static __forceinline bool TryGetFirstBlockingHitOwnedBy(
+    const SDK::TArray<SDK::FHitResult>& HitResults,
+    SDK::AActor* ExpectedOwner,
+    SDK::FHitResult* OutHit = nullptr)
+{
+    if (!ExpectedOwner)
+    {
+        return false;
+    }
+
+    SDK::FHitResult FirstBlockingHit{};
+    if (!TryGetFirstBlockingHit(HitResults, &FirstBlockingHit))
+    {
+        return false;
+    }
+
+    auto* const HitComponent = FirstBlockingHit.Component.Get();
+    auto* const HitOwner = HitComponent ? HitComponent->GetOwner() : nullptr;
+    if (!HitOwner || !DoesActorMatchExpectedOwnerHierarchy(HitOwner, ExpectedOwner))
+    {
+        return false;
+    }
+
+    if (OutHit)
+    {
+        *OutHit = FirstBlockingHit;
+    }
+
+    return true;
+}
 
 namespace FLinearColors
 {

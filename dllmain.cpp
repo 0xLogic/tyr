@@ -4,6 +4,8 @@
 #include "SDK/Engine_classes.hpp"
 #include "ESP.hpp"
 #include "Aimbot.hpp"
+#include "FeatureConfig.hpp"
+#include "OverlayMenu.hpp"
 #include "safteyhook.hpp"
 
 
@@ -111,7 +113,8 @@ void hkProcessEvent(SDK::UObject* pObject, SDK::UFunction* pFunction, void* pPar
     //}
 
 
-    if (FuncName.find("GetReloadTime") != std::string::npos)
+    if (EmpireFeatures::Get(EmpireFeatures::InstantReload) &&
+        FuncName.find("GetReloadTime") != std::string::npos)
     {
         // First, call the original function so the engine runs its logic
         oProcessEvent.call(pObject, pFunction, pParms);
@@ -129,7 +132,8 @@ void hkProcessEvent(SDK::UObject* pObject, SDK::UFunction* pFunction, void* pPar
         // Return immediately since we already called the original
         return;
     }
-    if (FuncName.find("GetMaxSpeed") != std::string::npos)
+    if (EmpireFeatures::Get(EmpireFeatures::SpeedHack) &&
+        FuncName.find("GetMaxSpeed") != std::string::npos)
     {
         // First, call the original function so the engine runs its logic
         oProcessEvent.call(pObject, pFunction, pParms);
@@ -293,6 +297,8 @@ DWORD MainThread(HMODULE Module)
 
    ApplyProcessEventHook();
 
+   OverlayMenu::Start();
+
     auto Viewport = World->OwningGameInstance->LocalPlayers[0]->ViewportClient;
     HookVftFunction(Viewport, DrawTransition, 0x70, &OriginalDrawTransition);
 
@@ -306,6 +312,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     {
     case DLL_PROCESS_ATTACH:
         CreateThread(0, 0, (LPTHREAD_START_ROUTINE)MainThread, hModule, 0, 0);
+        break;
+    case DLL_PROCESS_DETACH:
+        OverlayMenu::Stop();
         break;
     }
 
