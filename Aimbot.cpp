@@ -355,17 +355,59 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                         SDK::FVector predicted_loc = Predict(best_bone_loc, TargetVelocity, distance, b_speed, WorldGravityZ);
                         SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
 
-                        // PERMANENT F10 LOGIC: convert world rotation to hull-local "logical" frame
                         SDK::FRotator applied_rotation = target_rotation;
-                        if (self->TurretComponent)
+                        SDK::ATyrPlayerCameraManager* tyr_camera_manager = (SDK::ATyrPlayerCameraManager*)player_controller->PlayerCameraManager;
+
+                        float current_fov = tyr_camera_manager ? tyr_camera_manager->GetFOVAngle() : 90.0f;
+                        bool bIsInSniper = tyr_camera_manager && tyr_camera_manager->IsInSniper();
+                        bool bIsZoomed = bIsInSniper || current_fov < 80.0f; // Fallback to FOV if IsInSniper fails
+
+                        static bool bWasZoomed = false;
+                        if (bIsZoomed != bWasZoomed)
+                        {
+                            if (bIsZoomed) {
+                                DebugPrint("[Aimbot] Zoom detected (Sniper: %d, FOV: %.1f): F10 slope correction ACTIVATED.", bIsInSniper, current_fov);
+                            } else {
+                                DebugPrint("[Aimbot] Zoom ended (Sniper: %d, FOV: %.1f): F10 slope correction DEACTIVATED.", bIsInSniper, current_fov);
+                            }
+                            bWasZoomed = bIsZoomed;
+                        }
+
+                        // Always draw a debug panel on screen
+                        wchar_t debug_buf[256];
+                        swprintf_s(debug_buf, L"Aim Debug | Zoomed: %s | IsInSniper: %d | FOV: %.1f | F10 Active: %s", 
+                            bIsZoomed ? L"YES" : L"NO", 
+                            bIsInSniper, 
+                            current_fov,
+                            (bIsZoomed && self->TurretComponent) ? L"YES" : L"NO");
+
+                        Canvas->K2_DrawText(get_roboto(), FString(debug_buf), { 50.f, 300.f }, { 1.2f, 1.2f }, { 1.f, 1.f, 0.f, 1.f }, 1.f, { 0.f,0.f,0.f,1.f }, { 0,0 }, true, true, true, { 0.f,0.f,0.f,1.f });
+
+                        if (bIsZoomed && self->TurretComponent)
                         {
                             SDK::FVector ground_normal = self->TurretComponent->FilteredSuspensionNormal;
                             if (ground_normal.IsZero()) ground_normal = SDK::FVector{ 0.0, 0.0, 1.0 };
                             applied_rotation = SDK::UTyrCameraFunctionLibrary::GetLogicalRotationFromCameraWorld(ground_normal, target_rotation);
+
+                            // Visual indicator on screen (centered)
+                            SDK::FLinearColor TextColor = { 0.f, 1.f, 0.f, 1.f }; // Green
+                            Canvas->K2_DrawText(get_roboto(), FString(L"F10 LOGIC ACTIVE (ZOOMED)"), { (float)Canvas->ClipX / 2 - 100.f, 150.f }, { 1.2f, 1.2f }, TextColor, 1.f, { 0.f,0.f,0.f,1.f }, { 0,0 }, true, true, true, { 0.f,0.f,0.f,1.f });
                         }
 
                         player_controller->SetControlRotation(applied_rotation);
-                        if (self->TurretComponent) self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
+                        if (self->TurretComponent)
+                        {
+                            if (!bIsZoomed)
+                            {
+                                // When not zoomed, aimbot manages turret target directly using world rot
+                                self->TurretComponent->TargetTurretRotation = target_rotation;
+                            }
+                            else
+                            {
+                                // SetTurretRotationFromTargetLocation provides the native handling when zoomed
+                                self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
+                            }
+                        }
                     }
                 }
             }
