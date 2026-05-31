@@ -823,7 +823,13 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
     // Pull bullet speed + target velocity. Lead-only prediction (no drop).
     auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
     if (!ps || !ps->VehicleStatsAttribute) return;
-    const float b_speed = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+    // ShellVelocity attribute is authored in m/s, but Unreal world coordinates
+    // are in cm. The firing BP multiplies by 100 before passing to the
+    // projectile spawn (GA_MainWeapon_Fire's Multiply_DoubleDouble step), so
+    // we have to do the same here or our time-of-flight is 100x too large
+    // and we over-lead by 100x.
+    const float b_speed_raw = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+    const float b_speed = b_speed_raw * 100.0f;
     const SDK::FVector TargetVelocity = Mouse4Target->GetVelocity();
     const float distance = (float)fire_origin.GetDistanceTo(best_bone_loc);
     const SDK::FVector predicted_loc = PredictLead(best_bone_loc, TargetVelocity, distance, b_speed);
@@ -898,7 +904,8 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
     }
 
     const double tof = (b_speed > 0.001f) ? (double)distance / (double)b_speed : 0.0;
-    draw(std::wstring(L"Ballistic: bSpd=") + FormatDoubleWide(b_speed, 0) +
+    draw(std::wstring(L"Ballistic: bSpdRaw=") + FormatDoubleWide(b_speed_raw, 1) +
+        L"  bSpdUsed=" + FormatDoubleWide(b_speed, 0) +
         L"  ToF=" + FormatDoubleWide(tof, 3) +
         L"  slantDist=" + FormatDoubleWide(distance, 0));
     draw(std::wstring(L"CtrlRot: ") + FormatRotatorWide(current_control_rotation));
