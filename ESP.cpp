@@ -81,6 +81,36 @@ namespace
         std::map<std::string, SDK::ABP_BaseTank_C*> TanksByPlayerName{};
     };
 
+    struct ProjectileOriginReference
+    {
+        SDK::FVector FireOriginWorld{};
+        std::string EntityKey{};
+        std::wstring VehicleName{};
+        bool IsEnemy = false;
+    };
+
+    struct ProjectileTrackingContext
+    {
+        std::vector<ProjectileOriginReference> FriendlyFireOrigins{};
+        std::vector<ProjectileOriginReference> EnemyFireOrigins{};
+    };
+
+    enum class ProjectileSourceMatchKind
+    {
+        Unknown,
+        Friendly,
+        Enemy
+    };
+
+    struct ProjectileOriginEstimate
+    {
+        SDK::FVector OriginWorld{};
+        std::string EntityKey{};
+        std::wstring VehicleName{};
+        ProjectileSourceMatchKind MatchKind = ProjectileSourceMatchKind::Unknown;
+        bool HasOriginWorld = false;
+    };
+
     struct ArmorVisualizationSetupState
     {
         SDK::ABP_BaseTank_C* Tank = nullptr;
@@ -573,10 +603,11 @@ namespace
         return false;
     }
 
-    static void UpdateEnemyShellFireMarkerFromLocation(
+    static void UpdateShellFireMarkerFromLocation(
         const std::string& EntityKey,
         const std::wstring& VehicleName,
-        const SDK::FVector& FireOriginWorld)
+        const SDK::FVector& FireOriginWorld,
+        const SDK::FLinearColor& MarkerColor)
     {
         if (EntityKey.empty() || FireOriginWorld.IsZero())
         {
@@ -586,9 +617,21 @@ namespace
         auto& markerInfo = g_EnemyShellFireMarkerCache[EntityKey];
         markerInfo.LastFireOriginWorld = FireOriginWorld;
         markerInfo.VehicleName = VehicleName;
-        markerInfo.MarkerColor = ResolveTrackedEntityIndicatorColor(EntityKey);
+        markerInfo.MarkerColor = MarkerColor;
         markerInfo.LastMarkerTick = GetTickCount64();
         markerInfo.HasMarker = true;
+    }
+
+    static void UpdateEnemyShellFireMarkerFromLocation(
+        const std::string& EntityKey,
+        const std::wstring& VehicleName,
+        const SDK::FVector& FireOriginWorld)
+    {
+        UpdateShellFireMarkerFromLocation(
+            EntityKey,
+            VehicleName,
+            FireOriginWorld,
+            ResolveTrackedEntityIndicatorColor(EntityKey));
     }
 
     static bool TryGetProjectileOriginWorldLocation(
@@ -633,31 +676,6 @@ namespace
                 *OutOriginWorld = estimatedOrigin;
                 return true;
             }
-        }
-
-        const SDK::FVector currentLocation = Projectile->K2_GetActorLocation();
-        if (!currentLocation.IsZero())
-        {
-            SDK::FVector projectileVelocity{};
-            if (IsUsableObject(canonicalProjectile))
-            {
-                projectileVelocity = canonicalProjectile->GetVelocity();
-            }
-
-            if (projectileVelocity.IsZero())
-            {
-                projectileVelocity = Projectile->GetVelocity();
-            }
-
-            const double projectileVelocityMagnitude = projectileVelocity.Magnitude();
-            if (projectileVelocityMagnitude > 0.001)
-            {
-                *OutOriginWorld = currentLocation - (projectileVelocity * (150.0 / projectileVelocityMagnitude));
-                return true;
-            }
-
-            *OutOriginWorld = currentLocation;
-            return true;
         }
 
         return false;
@@ -1500,6 +1518,310 @@ namespace
         return !OutStartWorld->IsZero();
     }
 
+    static bool TryGetProjectileGravityZ(
+        SDK::UWorld* World,
+        SDK::ATyrProjectile* Projectile,
+        float* OutGravityZ)
+    {
+        if (!OutGravityZ)
+        {
+            return false;
+        }
+
+        *OutGravityZ = -980.0f;
+        if (!IsUsableObject(Projectile))
+        {
+            return false;
+        }
+
+        float worldGravityZ = -980.0f;
+        if (World)
+        {
+            auto* const worldSettings = World->K2_GetWorldSettings();
+            if (worldSettings)
+            {
+                worldGravityZ = worldSettings->GlobalGravityZ;
+            }
+        }
+
+        float gravityScale = 1.0f;
+        SDK::ATyrProjectile* const canonicalProjectile = GetCanonicalProjectileForTracking(Projectile);
+        SDK::UProjectileMovementComponent* projectileMovement = nullptr;
+        if (IsUsableObject(canonicalProjectile) && IsUsableObject(canonicalProjectile->ProjectileMovement))
+        {
+            projectileMovement = canonicalProjectile->ProjectileMovement;
+        }
+        else if (IsUsableObject(Projectile->ProjectileMovement))
+        {
+            projectileMovement = Projectile->ProjectileMovement;
+        }
+
+        if (IsUsableObject(projectileMovement))
+        {
+            gravityScale = projectileMovement->ProjectileGravityScale;
+        }
+
+        *OutGravityZ = worldGravityZ * gravityScale;
+        return true;
+    }
+
+    static bool TryGetProjectileObservedSeed(
+        const EnemyProjectileTrailInfo& TrailInfo,
+        float GravityZ,
+        SDK::FVector* OutSeedWorld,
+        SDK::FVector* OutSeedVelocity)
+    {
+        if (!OutSeedWorld || !OutSeedVelocity)
+        {
+            return false;
+        }
+
+        *OutSeedWorld = SDK::FVector{};
+        *OutSeedVelocity = SDK::FVector{};
+
+        const SDK::FVector acceleration{ 0.0, 0.0, static_cast<double>(GravityZ) };
+        if (TrailInfo.Samples.size() >= 2)
+        {
+            const EnemyProjectileTrailSample& firstSample = TrailInfo.Samples[0];
+            const EnemyProjectileTrailSample& secondSample = TrailInfo.Samples[1];
+            if (!firstSample.WorldLocation.IsZero() && !secondSample.WorldLocation.IsZero())
+            {
+                const double dtSeconds =
+                    secondSample.SampleTick >= firstSample.SampleTick
+                    ? static_cast<double>(secondSample.SampleTick - firstSample.SampleTick) / 1000.0
+                    : 0.0;
+                if (dtSeconds > 0.001)
+                {
+                    const SDK::FVector deltaWorld = secondSample.WorldLocation - firstSample.WorldLocation;
+                    const SDK::FVector seedVelocity =
+                        (deltaWorld - (acceleration * (0.5 * dtSeconds * dtSeconds))) * (1.0 / dtSeconds);
+                    if (!seedVelocity.IsZero())
+                    {
+                        *OutSeedWorld = firstSample.WorldLocation;
+                        *OutSeedVelocity = seedVelocity;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (!TrailInfo.Samples.empty() &&
+            TrailInfo.HasLastProjectileVelocity &&
+            !TrailInfo.Samples.front().WorldLocation.IsZero() &&
+            !TrailInfo.LastProjectileVelocity.IsZero())
+        {
+            *OutSeedWorld = TrailInfo.Samples.front().WorldLocation;
+            *OutSeedVelocity = TrailInfo.LastProjectileVelocity;
+            return true;
+        }
+
+        if (TrailInfo.HasLastProjectileWorld &&
+            TrailInfo.HasLastProjectileVelocity &&
+            !TrailInfo.LastProjectileWorld.IsZero() &&
+            !TrailInfo.LastProjectileVelocity.IsZero())
+        {
+            *OutSeedWorld = TrailInfo.LastProjectileWorld;
+            *OutSeedVelocity = TrailInfo.LastProjectileVelocity;
+            return true;
+        }
+
+        return false;
+    }
+
+    static ProjectileSourceMatchKind TryResolveProjectileSourceMatch(
+        const ProjectileTrackingContext& TrackingContext,
+        const SDK::FVector& CandidateOriginWorld,
+        SDK::FVector* OutMatchedOriginWorld,
+        std::string* OutEntityKey,
+        std::wstring* OutVehicleName)
+    {
+        if (OutMatchedOriginWorld)
+        {
+            *OutMatchedOriginWorld = SDK::FVector{};
+        }
+
+        if (OutEntityKey)
+        {
+            OutEntityKey->clear();
+        }
+
+        if (OutVehicleName)
+        {
+            OutVehicleName->clear();
+        }
+
+        if (CandidateOriginWorld.IsZero())
+        {
+            return ProjectileSourceMatchKind::Unknown;
+        }
+
+        constexpr double kSourceMatchRadius = 900.0;
+        constexpr double kNoMatchDistance = 1.0e18;
+
+        const ProjectileOriginReference* bestFriendlyReference = nullptr;
+        const ProjectileOriginReference* bestEnemyReference = nullptr;
+        double bestFriendlyDistance = kNoMatchDistance;
+        double bestEnemyDistance = kNoMatchDistance;
+
+        for (const ProjectileOriginReference& ref : TrackingContext.FriendlyFireOrigins)
+        {
+            if (ref.FireOriginWorld.IsZero())
+            {
+                continue;
+            }
+
+            const double matchDistance = ref.FireOriginWorld.GetDistanceTo(CandidateOriginWorld);
+            if (matchDistance < bestFriendlyDistance)
+            {
+                bestFriendlyDistance = matchDistance;
+                bestFriendlyReference = &ref;
+            }
+        }
+
+        for (const ProjectileOriginReference& ref : TrackingContext.EnemyFireOrigins)
+        {
+            if (ref.FireOriginWorld.IsZero())
+            {
+                continue;
+            }
+
+            const double matchDistance = ref.FireOriginWorld.GetDistanceTo(CandidateOriginWorld);
+            if (matchDistance < bestEnemyDistance)
+            {
+                bestEnemyDistance = matchDistance;
+                bestEnemyReference = &ref;
+            }
+        }
+
+        const ProjectileOriginReference* bestReference = nullptr;
+        ProjectileSourceMatchKind matchKind = ProjectileSourceMatchKind::Unknown;
+        if (bestFriendlyReference && bestFriendlyDistance <= kSourceMatchRadius)
+        {
+            bestReference = bestFriendlyReference;
+            matchKind = ProjectileSourceMatchKind::Friendly;
+        }
+        else if (bestEnemyReference && bestEnemyDistance <= kSourceMatchRadius)
+        {
+            bestReference = bestEnemyReference;
+            matchKind = ProjectileSourceMatchKind::Enemy;
+        }
+
+        if (!bestReference)
+        {
+            return ProjectileSourceMatchKind::Unknown;
+        }
+
+        if (OutMatchedOriginWorld)
+        {
+            *OutMatchedOriginWorld = bestReference->FireOriginWorld;
+        }
+
+        if (OutEntityKey)
+        {
+            *OutEntityKey = bestReference->EntityKey;
+        }
+
+        if (OutVehicleName)
+        {
+            *OutVehicleName = bestReference->VehicleName;
+        }
+
+        return matchKind;
+    }
+
+    static bool TryEstimateProjectileOriginFromBallistics(
+        const EnemyProjectileTrailInfo& TrailInfo,
+        float GravityZ,
+        const ProjectileTrackingContext& TrackingContext,
+        ProjectileOriginEstimate* OutEstimate)
+    {
+        if (!OutEstimate)
+        {
+            return false;
+        }
+
+        *OutEstimate = ProjectileOriginEstimate{};
+
+        SDK::FVector rewindWorld{};
+        SDK::FVector rewindVelocity{};
+        if (!TryGetProjectileObservedSeed(TrailInfo, GravityZ, &rewindWorld, &rewindVelocity))
+        {
+            if (TrailInfo.HasLastProjectileWorld &&
+                TrailInfo.HasLastProjectileVelocity &&
+                TryBuildVelocityBackstepPoint(TrailInfo.LastProjectileWorld, TrailInfo.LastProjectileVelocity, &OutEstimate->OriginWorld))
+            {
+                OutEstimate->HasOriginWorld = true;
+                return true;
+            }
+
+            return false;
+        }
+
+        SDK::FVector matchedOriginWorld{};
+        std::string matchedEntityKey{};
+        std::wstring matchedVehicleName{};
+        ProjectileSourceMatchKind matchKind = TryResolveProjectileSourceMatch(
+            TrackingContext,
+            rewindWorld,
+            &matchedOriginWorld,
+            &matchedEntityKey,
+            &matchedVehicleName);
+        if (matchKind != ProjectileSourceMatchKind::Unknown)
+        {
+            OutEstimate->OriginWorld = matchedOriginWorld;
+            OutEstimate->EntityKey = matchedEntityKey;
+            OutEstimate->VehicleName = matchedVehicleName;
+            OutEstimate->MatchKind = matchKind;
+            OutEstimate->HasOriginWorld = !matchedOriginWorld.IsZero();
+            return OutEstimate->HasOriginWorld;
+        }
+
+        constexpr double kBacktrackStepSeconds = 0.075;
+        constexpr double kMaxBacktrackSeconds = 6.0;
+        constexpr double kMaxBacktrackDistance = 60000.0;
+
+        const SDK::FVector acceleration{ 0.0, 0.0, static_cast<double>(GravityZ) };
+        double accumulatedDistance = 0.0;
+        double accumulatedSeconds = 0.0;
+
+        while (accumulatedSeconds < kMaxBacktrackSeconds && accumulatedDistance < kMaxBacktrackDistance)
+        {
+            const SDK::FVector previousWorld =
+                rewindWorld - (rewindVelocity * kBacktrackStepSeconds) + (acceleration * (0.5 * kBacktrackStepSeconds * kBacktrackStepSeconds));
+            const SDK::FVector previousVelocity =
+                rewindVelocity - (acceleration * kBacktrackStepSeconds);
+
+            accumulatedDistance += previousWorld.GetDistanceTo(rewindWorld);
+            rewindWorld = previousWorld;
+            rewindVelocity = previousVelocity;
+            accumulatedSeconds += kBacktrackStepSeconds;
+
+            matchedOriginWorld = SDK::FVector{};
+            matchedEntityKey.clear();
+            matchedVehicleName.clear();
+            matchKind = TryResolveProjectileSourceMatch(
+                TrackingContext,
+                rewindWorld,
+                &matchedOriginWorld,
+                &matchedEntityKey,
+                &matchedVehicleName);
+            if (matchKind != ProjectileSourceMatchKind::Unknown)
+            {
+                OutEstimate->OriginWorld = matchedOriginWorld;
+                OutEstimate->EntityKey = matchedEntityKey;
+                OutEstimate->VehicleName = matchedVehicleName;
+                OutEstimate->MatchKind = matchKind;
+                OutEstimate->HasOriginWorld = !matchedOriginWorld.IsZero();
+                return OutEstimate->HasOriginWorld;
+            }
+        }
+
+        OutEstimate->OriginWorld = rewindWorld;
+        OutEstimate->MatchKind = ProjectileSourceMatchKind::Unknown;
+        OutEstimate->HasOriginWorld = !rewindWorld.IsZero();
+        return OutEstimate->HasOriginWorld;
+    }
+
     static bool HasRenderableProjectileTrailData(const EnemyProjectileTrailInfo& TrailInfo)
     {
         if (TrailInfo.Samples.size() >= 2)
@@ -1545,8 +1867,10 @@ namespace
 
     static void RefreshEnemyProjectileTrail(
         SDK::ATyrAmmunition* Projectile,
+        SDK::UWorld* World,
         SDK::ATyrPlayerStateBase* SelfState,
-        const ProjectileOwnerLookup& OwnerLookup)
+        const ProjectileOwnerLookup& OwnerLookup,
+        const ProjectileTrackingContext& TrackingContext)
     {
         if (!IsUsableObject(Projectile) || !IsUsableObject(SelfState))
         {
@@ -1557,16 +1881,9 @@ namespace
         SDK::ABP_BaseTank_C* ownerTank = nullptr;
         bool bIsEnemy = false;
         SDK::ATyrProjectile* const canonicalProjectile = GetCanonicalProjectileForTracking(Projectile);
-        if (!TryGetProjectileOwnerState(Projectile, OwnerLookup, &ownerState, &ownerTank) &&
-            !TryGetProjectileOwnerState(canonicalProjectile, OwnerLookup, &ownerState, &ownerTank))
-        {
-            return;
-        }
-
-        if (!TryIsEnemy(SelfState, ownerState, &bIsEnemy) || !bIsEnemy)
-        {
-            return;
-        }
+        const bool bHasResolvedOwner =
+            TryGetProjectileOwnerState(Projectile, OwnerLookup, &ownerState, &ownerTank) ||
+            TryGetProjectileOwnerState(canonicalProjectile, OwnerLookup, &ownerState, &ownerTank);
 
         SDK::FVector projectileWorldLocation = Projectile->K2_GetActorLocation();
         if (projectileWorldLocation.IsZero() && IsUsableObject(canonicalProjectile))
@@ -1585,10 +1902,7 @@ namespace
             return;
         }
 
-        const std::string ownerEntityKey = BuildTrackedEntityKeyFromPlayerState(ownerState);
-
         auto& trailInfo = g_EnemyProjectileTrailCache[projectileKey];
-        trailInfo.VehicleName = GetVehicleDisplayName(ownerState);
         trailInfo.TrailColor = GetEnemyShellTrajectoryColor();
         trailInfo.LastProjectileWorld = projectileWorldLocation;
         trailInfo.HasLastProjectileWorld = true;
@@ -1607,30 +1921,33 @@ namespace
         trailInfo.LastProjectileVelocity = projectileVelocity;
         trailInfo.HasLastProjectileVelocity = !projectileVelocity.IsZero();
 
+        const std::string projectileMarkerKey = std::string("shot:") + projectileKey;
+        std::string markerEntityKey = projectileMarkerKey;
+        std::wstring vehicleName = L"Unknown shot";
+        bool bUseTrackedMarkerColor = false;
+
+        if (bHasResolvedOwner)
+        {
+            if (!TryIsEnemy(SelfState, ownerState, &bIsEnemy) || !bIsEnemy)
+            {
+                g_EnemyProjectileTrailCache.erase(projectileKey);
+                g_EnemyShellFireMarkerCache.erase(projectileMarkerKey);
+                return;
+            }
+
+            vehicleName = GetVehicleDisplayName(ownerState);
+            const std::string ownerEntityKey = BuildTrackedEntityKeyFromPlayerState(ownerState);
+            if (!ownerEntityKey.empty())
+            {
+                markerEntityKey = ownerEntityKey;
+                bUseTrackedMarkerColor = true;
+            }
+        }
+
         const ULONGLONG nowTick = GetTickCount64();
         if (trailInfo.FirstObservedTick == 0)
         {
             trailInfo.FirstObservedTick = nowTick;
-
-            SDK::FVector originWorld{};
-            if (TryGetProjectileOriginWorldLocation(IsUsableObject(canonicalProjectile) ? canonicalProjectile : Projectile, ownerTank, &originWorld))
-            {
-                trailInfo.OriginWorld = originWorld;
-                trailInfo.HasOriginWorld = true;
-                if (!ownerEntityKey.empty())
-                {
-                    UpdateEnemyShellFireMarkerFromLocation(ownerEntityKey, trailInfo.VehicleName, originWorld);
-                }
-            }
-        }
-        else if (!trailInfo.HasOriginWorld)
-        {
-            SDK::FVector originWorld{};
-            if (TryGetProjectileOriginWorldLocation(IsUsableObject(canonicalProjectile) ? canonicalProjectile : Projectile, ownerTank, &originWorld))
-            {
-                trailInfo.OriginWorld = originWorld;
-                trailInfo.HasOriginWorld = true;
-            }
         }
 
         trailInfo.LastObservedTick = nowTick;
@@ -1646,6 +1963,128 @@ namespace
         {
             trailInfo.Samples.back().WorldLocation = projectileWorldLocation;
             trailInfo.Samples.back().SampleTick = nowTick;
+        }
+
+        SDK::ATyrProjectile* const originProjectile = IsUsableObject(canonicalProjectile) ? canonicalProjectile : Projectile;
+        SDK::FVector resolvedOriginWorld{};
+        bool bHasResolvedOrigin = false;
+
+        if (bHasResolvedOwner)
+        {
+            if (TryGetProjectileOriginWorldLocation(originProjectile, ownerTank, &resolvedOriginWorld) &&
+                !resolvedOriginWorld.IsZero())
+            {
+                bHasResolvedOrigin = true;
+            }
+            else
+            {
+                float projectileGravityZ = -980.0f;
+                (void)TryGetProjectileGravityZ(World, originProjectile, &projectileGravityZ);
+
+                ProjectileOriginEstimate originEstimate{};
+                if (TryEstimateProjectileOriginFromBallistics(trailInfo, projectileGravityZ, TrackingContext, &originEstimate) &&
+                    originEstimate.HasOriginWorld &&
+                    !originEstimate.OriginWorld.IsZero())
+                {
+                    resolvedOriginWorld = originEstimate.OriginWorld;
+                    bHasResolvedOrigin = true;
+                }
+            }
+        }
+        else
+        {
+            SDK::FVector explicitOriginWorld{};
+            if (TryGetProjectileOriginWorldLocation(originProjectile, nullptr, &explicitOriginWorld) &&
+                !explicitOriginWorld.IsZero())
+            {
+                SDK::FVector matchedOriginWorld{};
+                std::string matchedEntityKey{};
+                std::wstring matchedVehicleName{};
+                const ProjectileSourceMatchKind matchKind = TryResolveProjectileSourceMatch(
+                    TrackingContext,
+                    explicitOriginWorld,
+                    &matchedOriginWorld,
+                    &matchedEntityKey,
+                    &matchedVehicleName);
+                if (matchKind == ProjectileSourceMatchKind::Friendly)
+                {
+                    g_EnemyProjectileTrailCache.erase(projectileKey);
+                    g_EnemyShellFireMarkerCache.erase(projectileMarkerKey);
+                    return;
+                }
+
+                if (matchKind == ProjectileSourceMatchKind::Enemy && !matchedOriginWorld.IsZero())
+                {
+                    resolvedOriginWorld = matchedOriginWorld;
+                    if (!matchedEntityKey.empty())
+                    {
+                        markerEntityKey = matchedEntityKey;
+                        bUseTrackedMarkerColor = true;
+                    }
+
+                    if (!matchedVehicleName.empty())
+                    {
+                        vehicleName = matchedVehicleName;
+                    }
+                }
+                else
+                {
+                    resolvedOriginWorld = explicitOriginWorld;
+                }
+
+                bHasResolvedOrigin = !resolvedOriginWorld.IsZero();
+            }
+            else
+            {
+                float projectileGravityZ = -980.0f;
+                (void)TryGetProjectileGravityZ(World, originProjectile, &projectileGravityZ);
+
+                ProjectileOriginEstimate originEstimate{};
+                if (TryEstimateProjectileOriginFromBallistics(trailInfo, projectileGravityZ, TrackingContext, &originEstimate) &&
+                    originEstimate.HasOriginWorld &&
+                    !originEstimate.OriginWorld.IsZero())
+                {
+                    if (originEstimate.MatchKind == ProjectileSourceMatchKind::Friendly)
+                    {
+                        g_EnemyProjectileTrailCache.erase(projectileKey);
+                        g_EnemyShellFireMarkerCache.erase(projectileMarkerKey);
+                        return;
+                    }
+
+                    resolvedOriginWorld = originEstimate.OriginWorld;
+                    if (originEstimate.MatchKind == ProjectileSourceMatchKind::Enemy)
+                    {
+                        if (!originEstimate.EntityKey.empty())
+                        {
+                            markerEntityKey = originEstimate.EntityKey;
+                            bUseTrackedMarkerColor = true;
+                        }
+
+                        if (!originEstimate.VehicleName.empty())
+                        {
+                            vehicleName = originEstimate.VehicleName;
+                        }
+                    }
+
+                    bHasResolvedOrigin = true;
+                }
+            }
+        }
+
+        trailInfo.VehicleName = vehicleName;
+        if (bHasResolvedOrigin)
+        {
+            trailInfo.OriginWorld = resolvedOriginWorld;
+            trailInfo.HasOriginWorld = true;
+
+            if (bUseTrackedMarkerColor)
+            {
+                UpdateEnemyShellFireMarkerFromLocation(markerEntityKey, trailInfo.VehicleName, resolvedOriginWorld);
+            }
+            else
+            {
+                UpdateShellFireMarkerFromLocation(markerEntityKey, trailInfo.VehicleName, resolvedOriginWorld, GetEnemyShellMarkerColor());
+            }
         }
     }
 
@@ -2703,6 +3142,22 @@ void Loop(UCanvas* Canvas) {
         {
             std::set<std::string> currentIndicatorsThisFrame;
             ProjectileOwnerLookup projectileOwnerLookup{};
+            ProjectileTrackingContext projectileTrackingContext{};
+            if (IsUsableTank(self) && IsUsableObject(self_ps))
+            {
+                RegisterProjectileOwnerLookup(&projectileOwnerLookup, self, self_ps);
+            }
+
+            if (!localFireOrigin.IsZero())
+            {
+                ProjectileOriginReference selfOriginReference{};
+                selfOriginReference.FireOriginWorld = localFireOrigin;
+                selfOriginReference.EntityKey = BuildTrackedEntityKey(self, self_ps);
+                selfOriginReference.VehicleName = GetVehicleDisplayName(self_ps);
+                selfOriginReference.IsEnemy = false;
+                projectileTrackingContext.FriendlyFireOrigins.push_back(selfOriginReference);
+            }
+
             TArray<AActor*>& Actors = Level->Actors;
             for (AActor* Actor : Actors)
             {
@@ -2730,8 +3185,29 @@ void Loop(UCanvas* Canvas) {
                     continue;
                 }
 
+                RegisterProjectileOwnerLookup(&projectileOwnerLookup, Player, player_ps);
+
                 bool bIsEnemy = false;
                 const bool bHasTeamRelation = TryIsEnemy(self_ps, player_ps, &bIsEnemy);
+                const std::wstring vehicleName = GetVehicleDisplayName(player_ps);
+                const SDK::FVector playerFireOrigin = GetEstimatedTankFireOrigin(Player);
+                if (bHasTeamRelation && !playerFireOrigin.IsZero())
+                {
+                    ProjectileOriginReference originReference{};
+                    originReference.FireOriginWorld = playerFireOrigin;
+                    originReference.EntityKey = entityKey;
+                    originReference.VehicleName = vehicleName;
+                    originReference.IsEnemy = bIsEnemy;
+
+                    if (bIsEnemy)
+                    {
+                        projectileTrackingContext.EnemyFireOrigins.push_back(originReference);
+                    }
+                    else
+                    {
+                        projectileTrackingContext.FriendlyFireOrigins.push_back(originReference);
+                    }
+                }
 
                 if (!bHasTeamRelation)
                 {
@@ -2751,9 +3227,6 @@ void Loop(UCanvas* Canvas) {
                     continue;
                 }
 
-                RegisterProjectileOwnerLookup(&projectileOwnerLookup, Player, player_ps);
-
-                const std::wstring vehicleName = GetVehicleDisplayName(player_ps);
                 RefreshEnemyShellFireMarker(entityKey, Player, vehicleName);
 
                 const int32 headBoneIndex = physicsBoneCount > 6 ? 6 : 0;
@@ -2853,7 +3326,7 @@ void Loop(UCanvas* Canvas) {
                 }
             }
 
-            if (drawShellTrajectoryIndicators)
+            if (drawShellTrajectoryIndicators || drawShotOriginIndicators)
             {
                 bool bObservedProjectileThisFrame = false;
                 auto refreshProjectileActors = [&](const TArray<AActor*>& ProjectileActors)
@@ -2866,7 +3339,7 @@ void Loop(UCanvas* Canvas) {
                         }
 
                         auto* const projectile = static_cast<ATyrAmmunition*>(ProjectileActor);
-                        RefreshEnemyProjectileTrail(projectile, self_ps, projectileOwnerLookup);
+                        RefreshEnemyProjectileTrail(projectile, World, self_ps, projectileOwnerLookup, projectileTrackingContext);
 
                         SDK::ATyrProjectile* const canonicalProjectile = GetCanonicalProjectileForTracking(projectile);
                         const std::string projectileKey = BuildProjectileKey(IsUsableObject(canonicalProjectile) ? canonicalProjectile : projectile);
