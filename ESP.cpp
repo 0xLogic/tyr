@@ -544,6 +544,111 @@ void Loop(UCanvas* Canvas) {
         bDumpedDataTables = false;
     }
 
+    static bool bNumpad8Pressed = false;
+    if (GetAsyncKeyState(VK_NUMPAD8) & 0x8000)
+    {
+        if (!bNumpad8Pressed)
+        {
+            if (auto PC = GetPlayerController())
+            {
+                if (PC->IsA(SDK::APC_TyrLobby_C::StaticClass()))
+                {
+                    ((SDK::APC_TyrLobby_C*)PC)->Server_PC_StartGame();
+                }
+            }
+            bNumpad8Pressed = true;
+        }
+    }
+    else
+    {
+        bNumpad8Pressed = false;
+    }
+
+    static bool bNumpad9Pressed = false;
+    if (GetAsyncKeyState(VK_NUMPAD9) & 0x8000)
+    {
+        if (!bNumpad9Pressed)
+        {
+            if (auto PC = GetPlayerController())
+            {
+                if (PC->IsA(SDK::APC_TyrLobby_C::StaticClass()))
+                {
+                  //  ((SDK::APC_TyrLobby_C*)PC)->Server_SetMapName(SDK::FName(L"Map_Garage"));
+                }
+            }
+            bNumpad9Pressed = true;
+        }
+    }
+    else
+    {
+        bNumpad9Pressed = false;
+    }
+
+    static bool bNumpad6Pressed = false;
+    if (GetAsyncKeyState(VK_NUMPAD6) & 0x8000)
+    {
+        if (!bNumpad6Pressed)
+        {
+            if (auto PC = GetPlayerController())
+            {
+                if (PC->PlayerState && PC->PlayerState->IsA(SDK::ATyrPlayerStateBase::StaticClass()))
+                {
+                    auto TyrPS = (SDK::ATyrPlayerStateBase*)PC->PlayerState;
+                    TyrPS->SetPlayerName(SDK::FString(L"Tyr"));
+
+                    // Find and set PlayerRecord directly from PlayerState (Works in Lobby)
+                    if (TyrPS->PlayerRecord)
+                    {
+                        TyrPS->PlayerRecord->PlayerTitle.TagName = GetUKismetStringLibrary().Conv_StringToName(L"Services.Profiles.Titles.Warden");
+                        TyrPS->PlayerRecord->OnRep_PlayerTitle();
+                        DebugPrintf("Successfully set Player Title to Warden via PlayerRecord and triggered UI refresh.");
+                    }
+                }
+            }
+
+            // Aggressively search for the Local Profile View Model to update the Lobby UI
+            for (int i = 0; i < UObject::GObjects->Num(); ++i)
+            {
+                UObject* Obj = UObject::GObjects->GetByIndex(i);
+                if (Obj && !Obj->IsDefaultObject() && Obj->IsA(UVM_LocalPlayerProfile_C::StaticClass()))
+                {
+                    auto ProfileVM = static_cast<UVM_LocalPlayerProfile_C*>(Obj);
+                    
+                    // Unlock all titles so you can just equip them in the menu if this fails
+                    for (int t = 0; t < ProfileVM->Titles.Num(); ++t)
+                    {
+                        if (auto TitleVM = ProfileVM->Titles[t])
+                        {
+                            TitleVM->bIsLocked = false;
+                            
+                            std::string tagStr = TitleVM->TitleTag.TagName.GetRawString();
+                            if (tagStr == "Services.Profiles.Titles.Warden")
+                            {
+                                ProfileVM->AssignTitle(TitleVM);
+                                DebugPrintf("Successfully applied Warden title via AssignTitle API!");
+                            }
+                        }
+                    }
+
+                    if (ProfileVM->LocalPlayerProfile)
+                    {
+                        FGameplayTag WardenTag;
+                        WardenTag.TagName = GetUKismetStringLibrary().Conv_StringToName(L"Services.Profiles.Titles.Warden");
+                        ProfileVM->LocalPlayerProfile->SetPlayerTitle(WardenTag);
+                        ProfileVM->RefreshTitle();
+                        DebugPrintf("Successfully forced Warden title to Local Profile ViewModel.");
+                    }
+                }
+            }
+
+            bNumpad6Pressed = true;
+        }
+    }
+    else
+    {
+        bNumpad6Pressed = false;
+    }
+
 
 
 
@@ -845,6 +950,24 @@ void Loop(UCanvas* Canvas) {
         }
     }
 
+    static bool bNumpad1Pressed = false;
+    static bool bAutoSpotEnabled = false;
+    static auto lastSpotTime = std::chrono::steady_clock::now();
+
+    if (GetAsyncKeyState(VK_NUMPAD1) & 0x8000)
+    {
+        if (!bNumpad1Pressed)
+        {
+            bAutoSpotEnabled = !bAutoSpotEnabled;
+            bNumpad1Pressed = true;
+            DebugPrintf(bAutoSpotEnabled ? "Auto-Spot Enabled" : "Auto-Spot Disabled");
+        }
+    }
+    else
+    {
+        bNumpad1Pressed = false;
+    }
+
     if (hasTargetedBoneThisFrame)
     {
         Canvas->K2_DrawText(get_roboto(), FString(targetedBoneName.c_str()), targetedBoneScreenLocation, FVector2D(1.f, 1.f), FLinearColors::Yellow, 1.0f, FLinearColor(0, 0, 0, 1), FVector2D(1, 1), true, true, true, FLinearColor(0, 0, 0, 0.7));
@@ -857,6 +980,15 @@ void Loop(UCanvas* Canvas) {
         if (Level)
         {
             TArray<AActor*>& Actors = Level->Actors;
+
+            auto now = std::chrono::steady_clock::now();
+            bool bShouldSpotThisFrame = false;
+            if (bAutoSpotEnabled && std::chrono::duration_cast<std::chrono::seconds>(now - lastSpotTime).count() >= 2)
+            {
+                bShouldSpotThisFrame = true;
+                lastSpotTime = now;
+            }
+
             for (AActor* Actor : Actors)
             {
                 if (!Actor || !Actor->IsA(ABP_BaseTank_C::StaticClass()))
@@ -865,6 +997,28 @@ void Loop(UCanvas* Canvas) {
                 auto const Player = static_cast<ABP_BaseTank_C*>(Actor);
                 if (Player == self || !Player->GetPhysicsMesh()) continue;
 
+                // --- Client-Side Visibility Hack (Custom Depth) ---
+                if (Player->ArmorMesh && !Player->ArmorMesh->bRenderCustomDepth)
+                {
+                    Player->ArmorMesh->SetRenderCustomDepth(true);
+                }
+                if (Player->VisualMesh && !Player->VisualMesh->bRenderCustomDepth)
+                {
+                    Player->VisualMesh->SetRenderCustomDepth(true);
+                }
+                
+                // --- Server-Side Auto-Spotter ---
+                if (bShouldSpotThisFrame)
+                {
+                    if (auto player_sight_component = Player->GetComponentByClass(UTyrPlayerSightComponent::StaticClass()))
+                    {
+                        auto other_sight_comp = static_cast<UTyrPlayerSightComponent*>(player_sight_component);
+                        if (APlayerController* PC = GetPlayerController())
+                        {
+                            other_sight_comp->K2_SpottedPlayer(PC);
+                        }
+                    }
+                }
 
                 FVector rootPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(0));
                 FVector headPos = Player->GetPhysicsMesh()->GetSocketLocation(Player->GetPhysicsMesh()->GetBoneName(6)); // Common head bone index
