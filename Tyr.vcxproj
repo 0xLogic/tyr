@@ -139,10 +139,12 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="ESP.cpp" />
     <ClCompile Include="Aimbot.cpp" />
+    <ClCompile Include="ServerProbe.cpp" />
     <ClCompile Include="safteyhook.cpp" />
     <ClCompile Include="SDK\Basic.cpp" />
     <ClCompile Include="SDK\BPFL_VehicleUtils_functions.cpp" />
     <ClCompile Include="SDK\BP_BaseTank_functions.cpp" />
+    <ClCompile Include="SDK\BP_TyrLobbyPlayerState_functions.cpp" />
     <ClCompile Include="SDK\CoreUObject_functions.cpp" />
     <ClCompile Include="SDK\Engine_functions.cpp" />
     <ClCompile Include="SDK\GameplayAbilities_functions.cpp" />
@@ -153,6 +155,7 @@
   <ItemGroup>
     <ClInclude Include="ESP.hpp" />
     <ClInclude Include="Aimbot.hpp" />
+    <ClInclude Include="ServerProbe.hpp" />
     <ClInclude Include="safteyhook.hpp" />
     <ClInclude Include="SDK\Basic.hpp" />
     <ClInclude Include="Zydis.h" />

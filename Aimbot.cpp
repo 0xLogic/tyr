@@ -543,6 +543,16 @@ static FName Mouse4LockedBoneName;
 static bool Mouse4DiagnosticsEnabled = true;
 static bool Mouse4DiagnosticsToggleWasDown = false;
 
+// ==================== ToF MULTIPLIER (scales with distance) =================
+static float ToFMultiplier = 1.0f;
+static bool  ToFIncWasDown = false;
+static bool  ToFDecWasDown = false;
+static bool  ToFResetWasDown = false;
+constexpr float MinMultiplier = 0.70f;
+constexpr float MaxMultiplier = 1.30f;
+constexpr float MultiStep = 0.01f;
+// =============================================================================
+
 static bool IsMouse4Down()
 {
     return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0;
@@ -558,6 +568,36 @@ static void HandleMouse4DiagnosticsToggle()
     }
     Mouse4DiagnosticsToggleWasDown = is_down;
 }
+
+static void HandleToFMultiplier()
+{
+    const bool incDown = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+    if (incDown && !ToFIncWasDown)
+    {
+        ToFMultiplier += MultiStep;
+        if (ToFMultiplier > MaxMultiplier) ToFMultiplier = MaxMultiplier;
+        DebugPrint("[Mouse4] ToF Multiplier += %.2f → %.2f×", MultiStep, ToFMultiplier);
+    }
+    ToFIncWasDown = incDown;
+
+    const bool decDown = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
+    if (decDown && !ToFDecWasDown)
+    {
+        ToFMultiplier -= MultiStep;
+        if (ToFMultiplier < MinMultiplier) ToFMultiplier = MinMultiplier;
+        DebugPrint("[Mouse4] ToF Multiplier -= %.2f → %.2f×", MultiStep, ToFMultiplier);
+    }
+    ToFDecWasDown = decDown;
+
+    const bool rstDown = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+    if (rstDown && !ToFResetWasDown)
+    {
+        ToFMultiplier = 1.0f;
+        DebugPrint("[Mouse4] ToF Multiplier RESET to 1.0×");
+    }
+    ToFResetWasDown = rstDown;
+}
+
 
 static std::wstring ToWide(const std::string& v)
 {
@@ -638,6 +678,7 @@ static bool IsNonCombatBaseTank(const std::string& cname)
 void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
 {
     HandleMouse4DiagnosticsToggle();
+    HandleToFMultiplier();
 
     if (!IsMouse4Down())
     {
@@ -832,28 +873,73 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
     auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
     if (!ps || !ps->VehicleStatsAttribute) return;
 
-    // ShellVelocity is already in cm/s. The firing BP's Multiply_DoubleDouble
-    // step has no second operand stored — it's a 1.0 type-widening pass-through,
-    // not a unit conversion. Use the raw value.
-    const float b_speed = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+    // ShellVelocity is authored in m/s, but our distance is in cm (UE units), so
+    // time-of-flight needs the speed in cm/s. Empirically, the raw value gives ~100x
+    // over-lead (tof in the tens of seconds), so scale m/s -> cm/s. Tunable in case
+    // the exact unit differs — read bSpdRaw/bSpdUsed/ToF on the F9 panel to dial it.
+    static float kSpeedToCmS = 100.0f;
+    const float b_speed_raw = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+    const float b_speed = b_speed_raw * kSpeedToCmS;
     const SDK::FVector TargetVelocity = Mouse4Target->GetVelocity();
     const float distance = (float)fire_origin.GetDistanceTo(best_bone_loc);
 
-    // Lead + small gravity drop. Tyr's UTyrProjectileMovementComponent inherits
-    // UE's default ProjectileGravityScale (1.0f) unless the projectile BP
-    // overrides it. The user reports "slightest drop" — consistent with a
-    // small fixed scale. Tunable here until we read the live value.
-    static float kProjectileGravityScale = 0.10f;
-    auto* world_settings = SDK::UWorld::GetWorld()->K2_GetWorldSettings();
-    const float world_grav = world_settings ? world_settings->GlobalGravityZ : -980.0f;
-    const float grav_abs = world_grav < 0 ? -world_grav : world_grav;
     const float tof = (b_speed > 0.001f) ? (distance / b_speed) : 0.0f;
-    const float drop_z = 0.5f * grav_abs * kProjectileGravityScale * tof * tof;
+    const float effective_tof = tof * ToFMultiplier;
 
-    SDK::FVector predicted_loc = best_bone_loc + (TargetVelocity * tof);
-    predicted_loc.Z += drop_z;
+    // Lead the target ourselves (with manual travel-time bias)
+    SDK::FVector predicted_loc = best_bone_loc + (TargetVelocity * effective_tof);
 
-    SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, predicted_loc);
+    // F8 toggles the game's OWN ballistic solver vs the hand-rolled lead+drop.
+    // DEFAULT OFF: the solver runs an internal LOS trace and REPLACES the target
+    // with the first thing the bore crosses (self/terrain), so used per-frame it
+    // makes the reticle jitter all over. Hand-rolled lead+drop is the stable path;
+    // F8 turns the solver on only for experimentation.
+    static bool s_UseBuiltinSolver = false;
+    static bool s_SolverKeyWasDown = false;
+    {
+        const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (down && !s_SolverKeyWasDown) { s_UseBuiltinSolver = !s_UseBuiltinSolver; DebugPrint("[Mouse4] BuiltinSolver=%d (F8)", s_UseBuiltinSolver ? 1 : 0); }
+        s_SolverKeyWasDown = down;
+    }
+
+    float out_grav = 0.f;
+    float drop_z = 0.f;
+    SDK::FVector aim_point = predicted_loc;
+
+    if (s_UseBuiltinSolver)
+    {
+        // Mirror the fire ability: muzzle origin + lead point, raw ShellVelocity,
+        // zero dispersion, direct-fire arc. Returns the world-space fire direction
+        // with gravity/arc/units resolved internally — no unit guessing on our end.
+        SDK::FInitialProjectileSetup setup{};
+        setup.TargetDirection = (predicted_loc - fire_origin).GetNormalized();
+        setup.InitialVelocity = b_speed;
+        setup.DisperseAngle = 0.f;
+        setup.MaxFiringAngle = 0.f;
+        setup.Rand1 = 0.f;
+        setup.Rand2 = 0.f;
+        setup.ArcFactor = 0.f;
+        SDK::FVector fire_dir = SDK::UTyrGameplayFunctionLibrary::CalculateFiringAngleFromInitialSetup(
+            GetWorld(), fire_origin, distance, setup, &out_grav);
+        if (!fire_dir.IsZero())
+        {
+            const float reach = distance > 1000.f ? distance : 1000.f;
+            aim_point = fire_origin + fire_dir * reach;   // arced fire direction
+        }
+        // else: solver out-of-range -> keep the plain lead point in aim_point
+    }
+    else
+    {
+        // Hand-rolled fallback: lead + small gravity drop (tunable scale).
+        static float kProjectileGravityScale = 0.10f;
+        auto* world_settings = SDK::UWorld::GetWorld()->K2_GetWorldSettings();
+        const float world_grav = world_settings ? world_settings->GlobalGravityZ : -980.0f;
+        const float grav_abs = world_grav < 0 ? -world_grav : world_grav;
+        drop_z = 0.5f * grav_abs * kProjectileGravityScale * effective_tof * effective_tof;
+        aim_point.Z += drop_z;
+    }
+
+    SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(fire_origin, aim_point);
 
     // Auto-apply hull-local rotation conversion when zoomed (main's pattern).
     SDK::FRotator applied_rotation = target_rotation;
@@ -878,7 +964,7 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
     // prediction" once the 100x scaling issue was untangled).
     if (self->TurretComponent)
     {
-        self->TurretComponent->SetTurretRotationFromTargetLocation(predicted_loc);
+        self->TurretComponent->SetTurretRotationFromTargetLocation(aim_point);
     }
 
     // Diagnostic panel (F9 toggles).
@@ -926,11 +1012,17 @@ void Aimbot::AimMouse4(UGameViewportClient* ViewportClient, UCanvas* Canvas)
             L" deg  N=" + FormatVectorWide(susp));
     }
 
-    draw(std::wstring(L"Ballistic: bSpd=") + FormatDoubleWide(b_speed, 1) +
+    draw(std::wstring(L"Ballistic: bSpdRaw=") + FormatDoubleWide(b_speed_raw, 1) +
+        L"  bSpdUsed=" + FormatDoubleWide(b_speed, 0) +
         L"  ToF=" + FormatDoubleWide(tof, 3) +
-        L"  slantDist=" + FormatDoubleWide(distance, 0) +
-        L"  dropZ=" + FormatSignedDoubleWide(drop_z, 1) +
-        L"  gScale=" + FormatDoubleWide(kProjectileGravityScale, 3));
+        L"  slantDist=" + FormatDoubleWide(distance, 0));
+    draw(std::wstring(L"Lead: ") + FormatVectorWide(SDK::FVector{ TargetVelocity.X * tof, TargetVelocity.Y * tof, TargetVelocity.Z * tof }) +
+        L"  |vel|=" + FormatDoubleWide((double)TargetVelocity.Magnitude(), 1) +
+        L"  solver=" + (s_UseBuiltinSolver ? L"BUILTIN(F8)" : L"handrolled") +
+        L"  dropZ=" + FormatSignedDoubleWide(drop_z, 1));
+    draw(std::wstring(L"ToF Multiplier: ") + FormatDoubleWide(ToFMultiplier, 2) + L"×");
+    draw(std::wstring(L"Effective ToF: ") + FormatDoubleWide(effective_tof, 3) + L" s");
+    draw(std::wstring(L"AimPoint: ") + FormatVectorWide(aim_point));
     draw(std::wstring(L"TgtVelMag: ") + FormatDoubleWide((double)TargetVelocity.Magnitude(), 1) +
         L"  LeadXY=" + FormatVectorWide(SDK::FVector{ TargetVelocity.X * tof, TargetVelocity.Y * tof, TargetVelocity.Z * tof }));
     draw(std::wstring(L"CtrlRot: ") + FormatRotatorWide(current_control_rotation));

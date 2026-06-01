@@ -4,6 +4,7 @@
 #include "SDK/Engine_classes.hpp"
 #include "ESP.hpp"
 #include "Aimbot.hpp"
+#include "ServerProbe.hpp"
 #include "safteyhook.hpp"
 
 
@@ -197,6 +198,7 @@ void DrawTransition(SDK::UGameViewportClient* ViewportClient /* this* */, SDK::U
     Aimbot::Loop(Canvas);
     Aimbot::Aim( ViewportClient, Canvas);
     Aimbot::AimMouse4(ViewportClient, Canvas);
+    ServerProbe::Loop(Canvas);
 
     //    static void* PreviousNetDriver = nullptr;
 
