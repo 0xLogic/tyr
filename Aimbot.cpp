@@ -442,10 +442,19 @@ void Aimbot::Aim(UGameViewportClient* ViewportClient, UCanvas* Canvas)
                             auto ps = GetTyrGameActionMessageStatics().GetTyrPlayerStateFromObject(self);
                             if (ps && ps->VehicleStatsAttribute)
                             {
-                                float b_speed = ps->VehicleStatsAttribute->ShellVelocity.BaseValue;
+                                // 4. Calculate Prediction with proper cm/s scaling
+                                float b_speed_raw = ps->VehicleStatsAttribute->ShellVelocity.CurrentValue;
+                                float b_speed = b_speed_raw * 100.0f; // m/s to cm/s
+                                
+                                SDK::FVector TargetVelocity = Target->GetVelocity();
+                                float tof = (b_speed > 0.001f) ? (distance / b_speed) : 0.0f;
+                                SDK::FVector predicted_loc = best_bone_loc + (TargetVelocity * tof);
 
-                                // 4. Calculate Prediction
-                                SDK::FVector predicted_loc = Predict(best_bone_loc, LastUpdateVelocity, distance, b_speed, WorldGravityZ);
+                                // Apply gravity drop (tunable kProjectileGravityScale = 0.10f like the feature branch)
+                                float grav_abs = WorldGravityZ < 0 ? -WorldGravityZ : WorldGravityZ;
+                                float kProjectileGravityScale = 0.10f;
+                                float drop_z = 0.5f * grav_abs * kProjectileGravityScale * tof * tof;
+                                predicted_loc.Z += drop_z;
 
                                 // 5. Calculate Target Rotation
                                 SDK::FRotator target_rotation = UKismetMathLibrary::FindLookAtRotation(camera_loc, predicted_loc);
